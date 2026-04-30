@@ -659,6 +659,152 @@ async def download_status():
     return {"running": bool(lock_since), "lock_since": lock_since}
 
 
+#------------------------------
+# 获取指定up的视频动态列表
+#------------------------------
+
+
+async def fetch_all_up_video_dynamic(uid: int, cookie: str):
+    """
+    自动翻页 + WBI 签名
+    只获取视频动态（DYNAMIC_TYPE_AV）
+    """
+    headers = {
+        "Cookie": cookie,
+        "User-Agent": "Mozilla/5.0",
+        "Referer": f"https://space.bilibili.com/{uid}/dynamic",
+    }
+
+    offset = ""
+    results = []
+
+    async with httpx.AsyncClient(headers=headers, timeout=10) as client:
+        # ⭐ 必须先获取 WBI key
+        wbi_key = await get_wbi_key(client)
+
+        while True:
+            params = {
+                "host_mid": uid,
+                "offset": offset,
+            }
+            params = wbi_sign(params, wbi_key)
+
+            resp = await client.get(
+                "https://api.bilibili.com/x/polymer/web-dynamic/v1/feed/space",
+                params=params
+            )
+            data = resp.json()
+
+            if data.get("code") != 0:
+                return {"error": "获取动态失败", "raw": data}
+
+            items = data["data"]["items"]
+            if not items:
+                break
+
+            for item in items:
+                if item["type"] != "DYNAMIC_TYPE_AV":
+                    continue
+
+                archive = item["modules"]["module_dynamic"]["major"]["archive"]
+
+                results.append({
+                    "type": "video",
+                    "title": archive["title"],
+                    "bv": archive["bvid"],
+                    "cover": archive["cover"],
+                    "desc": archive.get("desc", ""),
+                    "pubtime": item["modules"]["module_author"]["pub_ts"],
+                })
+
+            offset = data["data"]["offset"]
+            if not offset:
+                break
+
+    return results
+
+
+
+@app.get("/up_video_dynamic_all")
+async def up_video_dynamic_all(uid: int):
+    cookie = await load_cookie()
+    if not cookie:
+        return {"error": "not logged in"}
+
+    data = await fetch_all_up_video_dynamic(uid, cookie)
+    return data
+
+# -----------------------------
+# 获取指定用户的最新动态
+# -----------------------------
+
+async def fetch_latest_up_video_dynamic(uid: int, cookie: str):
+    """
+    只检查 UP 主最新的视频动态（不翻页）
+    返回：最新视频动态 或 None
+    """
+    headers = {
+        "Cookie": cookie,
+        "User-Agent": "Mozilla/5.0",
+        "Referer": f"https://space.bilibili.com/{uid}/dynamic",
+    }
+
+    async with httpx.AsyncClient(headers=headers, timeout=10) as client:
+        # WBI key
+        wbi_key = await get_wbi_key(client)
+
+        params = {"host_mid": uid, "offset": ""}
+        params = wbi_sign(params, wbi_key)
+
+        resp = await client.get(
+            "https://api.bilibili.com/x/polymer/web-dynamic/v1/feed/space",
+            params=params
+        )
+        data = resp.json()
+
+    if data.get("code") != 0:
+        return None
+
+    items = data["data"]["items"]
+
+    for item in items:
+        if item["type"] != "DYNAMIC_TYPE_AV":
+            continue
+
+        archive = item["modules"]["module_dynamic"]["major"]["archive"]
+
+        return {
+            "dynamic_id": item["id_str"],
+            "title": archive["title"],
+            "bv": archive["bvid"],
+            "cover": archive["cover"],
+            "desc": archive.get("desc", ""),
+            "pubtime": item["modules"]["module_author"]["pub_ts"],
+        }
+
+    return None
+
+@app.get("/check_up_new_video")
+async def check_up_new_video(uid: int):
+    cookie = await load_cookie()
+    if not cookie:
+        return {"error": "not logged in"}
+
+    latest = await fetch_latest_up_video_dynamic(uid, cookie)
+    if not latest:
+        return {"error": "获取失败"}
+
+    # dynamic_id = latest["dynamic_id"]
+
+    # # 已处理过
+    # if await r.sismember("bili:dynamic:processed", dynamic_id):
+    #     return {"new": False}
+
+    # # 新动态
+    # await r.sadd("bili:dynamic:processed", dynamic_id)
+    return {"new": True, "data": latest}
+
+
 # -----------------------------
 # Cookie 保活接口（定期调用）
 # -----------------------------
@@ -689,6 +835,8 @@ async def keep_alive():
         return {"status": "ok", "uname": data["data"]["uname"]}
     else:
         return {"status": "failed", "data": data}
+    
+
 
 
 # -----------------------------

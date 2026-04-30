@@ -147,6 +147,48 @@ curl http://localhost:8000/health
 | `logged_in` | 是否已有登录 Cookie |
 | `bilibili_api` | B 站接口是否可达 |
 
+## systemd 服务（Linux）
+
+创建服务文件：
+
+```bash
+sudo nano /etc/systemd/system/bili-auto.service
+```
+
+填入以下内容：
+
+```ini
+[Unit]
+Description=bili-auto API Service
+After=network.target redis.service
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/auto-bili
+EnvironmentFile=/home/ubuntu/auto-bili/.env
+ExecStart=/home/ubuntu/auto-bili/.venv/bin/bili-auto
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+```
+
+启用并启动：
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable bili-auto
+sudo systemctl start bili-auto
+
+# 查看状态
+sudo systemctl status bili-auto
+
+# 查看日志
+sudo journalctl -u bili-auto -f
+```
+
 ## 项目结构
 
 ```
