@@ -2,6 +2,14 @@
 
 自动扫描 B 站收藏夹、将新视频入队，并以最高画质下载合并为 MP4 的异步工具。
 
+> **免责声明**
+>
+> 本项目仅供个人学习与技术研究使用，请勿用于任何商业或违法用途。
+>
+> - 下载的视频版权归原作者及 B 站平台所有，请在 24 小时内删除，勿二次传播
+> - 使用本工具须遵守 [哔哩哔哩用户协议](https://www.bilibili.com/blackboard/protocal.html) 及相关法律法规
+> - 因使用本工具导致的账号封禁、法律责任等一切后果由使用者自行承担，与作者无关
+
 ## 功能
 
 - **扫码登录**：浏览器打开页面即可扫码，Cookie 存入 Redis，无需本地文件
@@ -22,11 +30,20 @@
 
 ## 安装
 
+**从 PyPI 安装（推荐）：**
+
 ```bash
-# 安装依赖
-uv sync
+pip install bili-auto
 # 或
-pip install -e .
+uv add bili-auto
+```
+
+**从源码安装（开发模式）：**
+
+```bash
+git clone https://github.com/yourname/bili-auto.git
+cd bili-auto
+uv sync
 ```
 
 ## 配置
@@ -54,9 +71,9 @@ cp .env.example .env
 ### 1. 启动 API 服务
 
 ```bash
-python bili_auto.py
-# 或
-uvicorn bili_auto:app --host 0.0.0.0 --port 8000
+bili-auto
+# 或（开发模式）
+uvicorn bili_auto.api:app --host 0.0.0.0 --port 8000
 ```
 
 ### 2. 扫码登录
@@ -76,7 +93,7 @@ curl "http://localhost:8000/scan_fav?folder_name=我的收藏"
 ### 4. 执行下载
 
 ```bash
-python downloader.py
+bili-downloader
 ```
 
 每次运行最多下载 `MAX_DOWNLOADS_PER_RUN` 个视频。可配合 cron 定时执行：
@@ -86,7 +103,7 @@ python downloader.py
 0 * * * * curl -s http://localhost:8000/scan_fav
 
 # 每小时下载一次队列
-30 * * * * cd /path/to/bili-auto && .venv/bin/python downloader.py
+30 * * * * /path/to/.venv/bin/bili-downloader
 ```
 
 ### 5. Cookie 保活（可选）
@@ -125,12 +142,16 @@ curl http://localhost:8000/health
 
 ```
 bili-auto/
-├── bili_auto.py      # FastAPI 服务：登录、扫描、Cookie 管理
-├── downloader.py     # 独立下载脚本：消费 Redis 队列
-├── .env              # 本地配置（不提交）
-├── .env.example      # 配置示例
-├── logs/             # 日志目录（自动创建）
-└── downloads/        # 视频下载目录（自动创建）
+├── src/
+│   └── bili_auto/
+│       ├── __init__.py
+│       ├── api.py          # FastAPI 服务：登录、扫描、Cookie 管理
+│       └── downloader.py   # 独立下载脚本：消费 Redis 队列
+├── .env                    # 本地配置（不提交）
+├── .env.example            # 配置示例
+├── pyproject.toml
+├── logs/                   # 日志目录（自动创建）
+└── downloads/              # 视频下载目录（自动创建）
 ```
 
 ## Redis 数据结构

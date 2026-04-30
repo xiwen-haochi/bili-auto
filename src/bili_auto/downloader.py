@@ -308,5 +308,10 @@ async def async_main() -> None:
         await r.aclose()
 
 
-if __name__ == "__main__":
+def main() -> None:
+    """CLI 入口：运行下载队列消费脚本。"""
     asyncio.run(async_main())
+
+
+if __name__ == "__main__":
+    main()
