@@ -1,0 +1,15 @@
+[project]
+name = "bili-auto"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi>=0.136.1",
+    "httpx>=0.28.1",
+    "qrcode>=8.2",
+    "redis>=7.4.0",
+    "requests>=2.33.1",
+    "tqdm>=4.67.3",
+    "uvicorn>=0.46.0",
+]
