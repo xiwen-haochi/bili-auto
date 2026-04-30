@@ -4,29 +4,31 @@ build-backend = "hatchling.build"
 
 [project]
 name = "bili-auto"
-version = "0.1.1"
+version = "0.1.2"
 description = "Bilibili auto-download service: QR login, favorites scanning, async download with Redis queue"
 readme = "README.md"
 license = { text = "MIT" }
-requires-python = ">=3.12"
+requires-python = ">=3.10"
 keywords = ["bilibili", "download", "fastapi", "async"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: End Users/Desktop",
     "License :: OSI Approved :: MIT License",
     "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Topic :: Multimedia :: Video",
 ]
 dependencies = [
-    "fastapi>=0.136.1",
-    "httpx>=0.28.1",
-    "pillow>=12.2.0",
-    "python-dotenv>=1.2.2",
-    "qrcode>=8.2",
-    "redis>=7.4.0",
-    "tqdm>=4.67.3",
-    "uvicorn>=0.46.0",
+    "fastapi",
+    "httpx",
+    "pillow",
+    "python-dotenv",
+    "qrcode",
+    "redis",
+    "tqdm",
+    "uvicorn",
 ]
 
 [project.scripts]
