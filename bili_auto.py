@@ -1,319 +1,612 @@
-import os
-import re
-import json
-import subprocess
-from io import BytesIO
-
+import asyncio
 import base64
-import requests
-import redis
+import json
+import re
+from contextlib import asynccontextmanager
+from datetime import datetime, timezone
+from io import BytesIO
+from secrets import token_hex
+from typing import Any, cast
+
+import httpx
 import qrcode
-from tqdm import tqdm
-from fastapi import FastAPI
+import redis.asyncio as redis
+from fastapi import BackgroundTasks, FastAPI, HTTPException
+from fastapi.responses import HTMLResponse
+from qrcode import constants as qrcode_constants
 
 # -----------------------------
 # 配置
 # -----------------------------
-COOKIE_FILE = "bili_cookie.txt"
 REDIS_KEY = "bili:downloaded"
+READY_REDIS_KEY = "bili:ready"
+COOKIE_REDIS_KEY = "bili:auth:cookie"
+LOGIN_REDIS_PREFIX = "bili:login:"
+VIDEO_REDIS_PREFIX = "bili:video:"
+SCAN_FAV_LOCK_KEY = "bili:scan_fav:lock"
+SCAN_FAV_LOCK_TTL_SECONDS = 1800
+LOGIN_POLL_INTERVAL_SECONDS = 10
+LOGIN_MAX_POLLS = 5
+LOGIN_KEY_TTL_SECONDS = 600
+CLIENT_TIMEOUT = httpx.Timeout(30.0, connect=10.0, read=60.0)
 
-r = redis.Redis(host="localhost", port=6379, decode_responses=True)
-app = FastAPI()
+r = cast(Any, redis.Redis(host="localhost", port=6379, decode_responses=True))
+
+
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    """使用 FastAPI 新版生命周期接口，在应用退出时关闭 Redis 连接。"""
+    try:
+        yield
+    finally:
+        await r.aclose()
+
+
+app = FastAPI(lifespan=lifespan)
 
 BASE_HEADERS = {
     "User-Agent": "Mozilla/5.0",
     "Referer": "https://www.bilibili.com",
 }
 
+AUTH_HEADERS = {
+    **BASE_HEADERS,
+    "Origin": "https://www.bilibili.com",
+}
+
 
 # -----------------------------
 # 工具函数
 # -----------------------------
-def save_cookie(cookie: str):
-    with open(COOKIE_FILE, "w") as f:
-        f.write(cookie)
+def now_iso() -> str:
+    """统一输出 UTC 时间字符串，便于 Redis 中的状态调试。"""
+    return datetime.now(timezone.utc).isoformat()
 
 
-def load_cookie():
-    if not os.path.exists(COOKIE_FILE):
-        return None
-    return open(COOKIE_FILE).read().strip()
+def login_state_key(qrcode_key: str) -> str:
+    """拼出二维码登录状态在 Redis 中对应的 key。"""
+    return f"{LOGIN_REDIS_PREFIX}{qrcode_key}"
 
 
-def extract_bvid(url: str):
-    if "b23.tv" in url:
-        resp = requests.get(url, headers=BASE_HEADERS, allow_redirects=True)
-        url = resp.url
-    m = re.search(r"BV([a-zA-Z0-9]{10})", url)
-    return "BV" + m.group(1) if m else None
+def video_state_key(bvid: str) -> str:
+    """拼出单个视频在 Redis 中的元数据 key。"""
+    return f"{VIDEO_REDIS_PREFIX}{bvid}"
 
 
-# -----------------------------
-# 登录：获取二维码
-# -----------------------------
-@app.get("/login_qrcode")
-def login_qrcode():
+async def save_login_state(qrcode_key: str, mapping: dict[str, str]) -> None:
+    """将二维码状态写入 Redis，并刷新过期时间。"""
+    key = login_state_key(qrcode_key)
+    await r.hset(key, mapping=mapping)
+    await r.expire(key, LOGIN_KEY_TTL_SECONDS)
+
+
+async def load_login_state(qrcode_key: str) -> dict[str, str] | None:
+    """读取 Redis 中的二维码状态，不存在时返回 None。"""
+    data = await r.hgetall(login_state_key(qrcode_key))
+    return data or None
+
+
+async def save_cookie(cookie: str) -> None:
+    """将当前登录态仅保存到 Redis，不再落地本地文件。"""
+    await r.set(COOKIE_REDIS_KEY, cookie)
+
+
+async def load_cookie() -> str | None:
+    """从 Redis 读取当前登录 Cookie。"""
+    return await r.get(COOKIE_REDIS_KEY)
+
+
+async def acquire_scan_lock() -> str | None:
+    """尝试获取扫描锁，成功时返回本次锁令牌，失败时返回 None。"""
+    lock_token = token_hex(16)
+    locked = await r.set(SCAN_FAV_LOCK_KEY, lock_token, ex=SCAN_FAV_LOCK_TTL_SECONDS, nx=True)
+    return lock_token if locked else None
+
+
+async def release_scan_lock(lock_token: str) -> None:
+    """只在当前请求仍持有锁时释放，避免误删其他请求的新锁。"""
+    current_token = await r.get(SCAN_FAV_LOCK_KEY)
+    if current_token == lock_token:
+        await r.delete(SCAN_FAV_LOCK_KEY)
+
+
+def cookies_to_string(cookies: httpx.Cookies) -> str:
+    """把 httpx 的 cookie 容器序列化成标准请求头格式。
+
+    httpx 在存在同名 cookie 且 domain/path 不同时，直接按名称读取会抛 CookieConflict，
+    这里改为遍历底层 cookie jar，并按名称保留最后一个值用于请求头。
     """
-    返回：
-    - qrcode_key：用于轮询登录状态
-    - qrcode_base64：前端直接 <img :src="qrcode_base64">
-    """
-    session = requests.Session()
+    cookie_map: dict[str, str] = {}
+    for cookie in cookies.jar:
+        if cookie.value is not None:
+            cookie_map[cookie.name] = cookie.value
+    return "; ".join(f"{key}={value}" for key, value in cookie_map.items())
 
-    headers = {
-        "User-Agent": "Mozilla/5.0",
-        "Referer": "https://www.bilibili.com",
-        "Origin": "https://www.bilibili.com",
-    }
 
-    api = "https://passport.bilibili.com/x/passport-login/web/qrcode/generate"
-    resp = session.get(api, headers=headers).json()
+def get_stream_url(stream: dict) -> str | None:
+    """兼容 B 站字段大小写差异，提取流地址。"""
+    return stream.get("baseUrl") or stream.get("base_url")
 
-    if resp.get("code") != 0:
-        return {"error": "获取二维码失败", "raw": resp}
 
-    qrcode_url = resp["data"]["url"]
-    qrcode_key = resp["data"]["qrcode_key"]
-
-    # 用 qrcode 库本地生成二维码图片
-    qr = qrcode.QRCode(error_correction=qrcode.constants.ERROR_CORRECT_L)
+def build_qrcode_data_url(qrcode_url: str) -> str:
+    """在服务端直接生成二维码图片，浏览器可以原样展示。"""
+    qr = qrcode.QRCode(error_correction=qrcode_constants.ERROR_CORRECT_L)
     qr.add_data(qrcode_url)
     qr.make(fit=True)
     img = qr.make_image(fill_color="black", back_color="white")
 
     buffer = BytesIO()
-    img.save(buffer, format="PNG")
+    cast(Any, img).save(buffer, "PNG")
     img_base64 = base64.b64encode(buffer.getvalue()).decode()
+    return "data:image/png;base64," + img_base64
 
-    return {
-        "qrcode_key": qrcode_key,
-        "qrcode_base64": "data:image/png;base64," + img_base64,
-    }
+
+def build_login_page(qrcode_key: str, qrcode_data_url: str) -> str:
+    """返回一个可直接扫码的页面，前端无需再自己拼图片。"""
+    qrcode_key_json = json.dumps(qrcode_key)
+    return f"""<!DOCTYPE html>
+<html lang=\"zh-CN\">
+<head>
+  <meta charset=\"UTF-8\" />
+  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\" />
+  <title>B 站扫码登录</title>
+  <style>
+    body {{
+      margin: 0;
+      min-height: 100vh;
+      display: grid;
+      place-items: center;
+      background: linear-gradient(135deg, #f7efe6 0%, #d8ecff 100%);
+      font-family: "PingFang SC", "Hiragino Sans GB", sans-serif;
+      color: #1f2937;
+    }}
+    .panel {{
+      width: min(92vw, 420px);
+      padding: 28px;
+      border-radius: 24px;
+      background: rgba(255, 255, 255, 0.92);
+      box-shadow: 0 20px 50px rgba(15, 23, 42, 0.15);
+      text-align: center;
+      backdrop-filter: blur(12px);
+    }}
+    img {{
+      width: min(72vw, 280px);
+      height: min(72vw, 280px);
+      border-radius: 16px;
+      background: #fff;
+      padding: 12px;
+      box-sizing: border-box;
+    }}
+    h1 {{
+      margin: 0 0 12px;
+      font-size: 26px;
+    }}
+    p {{
+      margin: 8px 0;
+      line-height: 1.6;
+    }}
+    .meta {{
+      color: #4b5563;
+      font-size: 14px;
+      word-break: break-all;
+    }}
+    .status {{
+      margin-top: 18px;
+      padding: 14px;
+      border-radius: 14px;
+      background: #f8fafc;
+    }}
+  </style>
+</head>
+<body>
+  <main class=\"panel\">
+    <h1>B 站扫码登录</h1>
+    <p>请直接使用 B 站 App 扫码，服务端会在后台每 10 秒轮询一次登录状态。</p>
+    <img src=\"{qrcode_data_url}\" alt=\"B 站登录二维码\" />
+    <div class=\"status\">
+      <p id=\"status\">状态：等待扫码</p>
+      <p id=\"message\">说明：二维码已生成，后台轮询已启动。</p>
+      <p id=\"poll-count\" class=\"meta\">轮询次数：0 / {LOGIN_MAX_POLLS}</p>
+      <p class=\"meta\">二维码 Key：{qrcode_key}</p>
+    </div>
+  </main>
+  <script>
+    const qrcodeKey = {qrcode_key_json};
+    const statusEl = document.getElementById("status");
+    const messageEl = document.getElementById("message");
+    const pollCountEl = document.getElementById("poll-count");
+
+    async function refreshLoginStatus() {{
+      try {{
+        const response = await fetch(`/login_poll?qrcode_key=${{encodeURIComponent(qrcodeKey)}}`, {{ cache: "no-store" }});
+        const data = await response.json();
+
+        statusEl.textContent = `状态：${{data.status || "unknown"}}`;
+        messageEl.textContent = `说明：${{data.message || "暂无状态说明"}}`;
+        pollCountEl.textContent = `轮询次数：${{data.poll_count || 0}} / {LOGIN_MAX_POLLS}`;
+
+        if (["success", "expired", "failed", "not_found"].includes(data.status)) {{
+          return;
+        }}
+      }} catch (error) {{
+        messageEl.textContent = `说明：状态查询失败，${{error}}`;
+      }}
+
+      setTimeout(refreshLoginStatus, 2000);
+    }}
+
+    refreshLoginStatus();
+  </script>
+</body>
+</html>
+"""
+
+
+async def fetch_json(
+    client: httpx.AsyncClient,
+    url: str,
+    *,
+    params: dict | None = None,
+    headers: dict[str, str] | None = None,
+) -> dict:
+    """统一处理 JSON 接口请求，便于复用错误检查。"""
+    response = await client.get(url, params=params, headers=headers)
+    response.raise_for_status()
+    return response.json()
+
+
+async def extract_bvid(url: str):
+    """兼容 b23 短链，必要时先跟随跳转再提取 BV 号。"""
+    if "b23.tv" in url:
+        async with httpx.AsyncClient(
+            headers=BASE_HEADERS,
+            follow_redirects=True,
+            timeout=CLIENT_TIMEOUT,
+        ) as client:
+            resp = await client.get(url)
+        url = str(resp.url)
+
+    m = re.search(r"BV([a-zA-Z0-9]{10})", url)
+    return "BV" + m.group(1) if m else None
+
+
+async def poll_login_status_task(qrcode_key: str) -> None:
+    """后台轮询 B 站登录状态，成功后把 Cookie 存入 Redis。"""
+    poll_url = "https://passport.bilibili.com/x/passport-login/web/qrcode/poll"
+
+    for attempt in range(1, LOGIN_MAX_POLLS + 1):
+        current_state = await load_login_state(qrcode_key)
+        if not current_state:
+            return
+
+        if current_state.get("status") in {"success", "expired", "failed"}:
+            return
+
+        async with httpx.AsyncClient(
+            headers=AUTH_HEADERS,
+            follow_redirects=True,
+            timeout=CLIENT_TIMEOUT,
+        ) as client:
+            try:
+                data = await fetch_json(client, poll_url, params={"qrcode_key": qrcode_key})
+            except Exception as exc:
+                await save_login_state(
+                    qrcode_key,
+                    {
+                        "status": "failed",
+                        "message": f"轮询异常：{exc}",
+                        "poll_count": str(attempt),
+                        "updated_at": now_iso(),
+                    },
+                )
+                return
+
+        poll_code = data.get("data", {}).get("code")
+
+        if poll_code in (-2, 86101):
+            await save_login_state(
+                qrcode_key,
+                {
+                    "status": "pending",
+                    "message": "等待扫码",
+                    "poll_count": str(attempt),
+                    "updated_at": now_iso(),
+                },
+            )
+        elif poll_code in (-4, 86090):
+            await save_login_state(
+                qrcode_key,
+                {
+                    "status": "pending",
+                    "message": "已扫码，等待手机确认",
+                    "poll_count": str(attempt),
+                    "updated_at": now_iso(),
+                },
+            )
+        elif poll_code == 0:
+            login_url = data["data"]["url"]
+            async with httpx.AsyncClient(
+                headers=AUTH_HEADERS,
+                follow_redirects=True,
+                timeout=CLIENT_TIMEOUT,
+            ) as client:
+                await client.get(login_url)
+                cookie_str = cookies_to_string(client.cookies)
+
+            await save_cookie(cookie_str)
+            await save_login_state(
+                qrcode_key,
+                {
+                    "status": "success",
+                    "message": "登录成功，Cookie 已写入 Redis",
+                    "poll_count": str(attempt),
+                    "cookie": cookie_str,
+                    "updated_at": now_iso(),
+                },
+            )
+            return
+        elif poll_code in (-5, 86038):
+            await save_login_state(
+                qrcode_key,
+                {
+                    "status": "expired",
+                    "message": "二维码已过期，请刷新页面重新获取",
+                    "poll_count": str(attempt),
+                    "updated_at": now_iso(),
+                },
+            )
+            return
+        else:
+            await save_login_state(
+                qrcode_key,
+                {
+                    "status": "failed",
+                    "message": f"未知登录状态：{poll_code}",
+                    "poll_count": str(attempt),
+                    "updated_at": now_iso(),
+                },
+            )
+            return
+
+        if attempt < LOGIN_MAX_POLLS:
+            await asyncio.sleep(LOGIN_POLL_INTERVAL_SECONDS)
+
+    await save_login_state(
+        qrcode_key,
+        {
+            "status": "expired",
+            "message": "轮询次数已达上限，请重新获取二维码",
+            "poll_count": str(LOGIN_MAX_POLLS),
+            "updated_at": now_iso(),
+        },
+    )
+
+
+# -----------------------------
+# 登录：获取二维码
+# -----------------------------
+@app.get("/")
+async def index():
+    """给浏览器一个简单入口，直接跳到二维码登录页。"""
+    return HTMLResponse('<meta http-equiv="refresh" content="0; url=/login_qrcode" />')
+
+
+@app.get("/login_qrcode", response_class=HTMLResponse)
+async def login_qrcode(background_tasks: BackgroundTasks):
+    """生成二维码页面，并在响应返回后启动后台轮询任务。"""
+    api = "https://passport.bilibili.com/x/passport-login/web/qrcode/generate"
+
+    async with httpx.AsyncClient(
+        headers=AUTH_HEADERS,
+        follow_redirects=True,
+        timeout=CLIENT_TIMEOUT,
+    ) as client:
+        resp = await fetch_json(client, api)
+
+    if resp.get("code") != 0:
+        raise HTTPException(status_code=502, detail={"error": "获取二维码失败", "raw": resp})
+
+    qrcode_url = resp["data"]["url"]
+    qrcode_key = resp["data"]["qrcode_key"]
+
+    await save_login_state(
+        qrcode_key,
+        {
+            "status": "pending",
+            "message": "二维码已生成，等待扫码",
+            "poll_count": "0",
+            "cookie": "",
+            "created_at": now_iso(),
+            "updated_at": now_iso(),
+        },
+    )
+
+    background_tasks.add_task(poll_login_status_task, qrcode_key)
+    qrcode_data_url = build_qrcode_data_url(qrcode_url)
+    return HTMLResponse(build_login_page(qrcode_key, qrcode_data_url))
 
 
 # -----------------------------
 # 登录：轮询二维码状态
 # -----------------------------
 @app.get("/login_poll")
-def login_poll(qrcode_key: str):
-    url = "https://passport.bilibili.com/x/passport-login/web/qrcode/poll"
-    headers = {
-        "User-Agent": "Mozilla/5.0",
-        "Referer": "https://www.bilibili.com",
-        "Origin": "https://www.bilibili.com",
+async def login_poll(qrcode_key: str):
+    """读取 Redis 中的轮询结果，前端无需自己再访问 B 站接口。"""
+    state = await load_login_state(qrcode_key)
+    if not state:
+        return {"status": "not_found", "message": "二维码状态不存在或已过期"}
+
+    return {
+        "status": state.get("status", "unknown"),
+        "message": state.get("message", ""),
+        "poll_count": int(state.get("poll_count", "0")),
+        "created_at": state.get("created_at", ""),
+        "updated_at": state.get("updated_at", ""),
+        "has_cookie": bool(state.get("cookie")),
     }
-
-    resp = requests.get(url, params={"qrcode_key": qrcode_key}, headers=headers)
-    try:
-        data = resp.json()
-    except Exception:
-        return {"error": "B站返回的不是JSON", "raw": resp.text}
-
-    code = data.get("data", {}).get("code")
-
-    # -2: 未扫码；-4: 已扫码未确认
-    if code in (-2, -4):
-        return {"status": "pending", "data": data}
-
-    # 0: 登录成功
-    if code == 0:
-        login_url = data["data"]["url"]
-        session = requests.Session()
-        session.get(login_url, headers=headers)
-
-        cookie_str = "; ".join([f"{k}={v}" for k, v in session.cookies.items()])
-        save_cookie(cookie_str)
-
-        return {"status": "success", "cookie": cookie_str}
-
-    return {"status": "unknown", "data": data}
-
-
-# -----------------------------
-# 下载相关
-# -----------------------------
-def download_file(url: str, filename: str, cookie: str):
-    headers = BASE_HEADERS.copy()
-    headers["Cookie"] = cookie
-
-    resp = requests.get(url, headers=headers, stream=True)
-    total = int(resp.headers.get("content-length", 0))
-
-    with (
-        open(filename, "wb") as f,
-        tqdm(
-            total=total, unit="B", unit_scale=True, desc=os.path.basename(filename)
-        ) as bar,
-    ):
-        for chunk in resp.iter_content(chunk_size=8192):
-            if chunk:
-                f.write(chunk)
-                bar.update(len(chunk))
-
-
-def merge_av(video_file: str, audio_file: str, output_file: str):
-    cmd = [
-        "ffmpeg",
-        "-y",
-        "-i",
-        video_file,
-        "-i",
-        audio_file,
-        "-c",
-        "copy",
-        output_file,
-    ]
-    subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT)
-
-
-def download_bv(bvid: str, cookie: str):
-    print(f"[下载] BV: {bvid}")
-
-    headers = {"Cookie": cookie, **BASE_HEADERS}
-
-    # 获取视频信息
-    view_resp = requests.get(
-        "https://api.bilibili.com/x/web-interface/view",
-        params={"bvid": bvid},
-        headers=headers,
-    ).json()
-
-    if view_resp.get("code") != 0:
-        print("[错误] 获取视频信息失败：", view_resp)
-        return
-
-    view = view_resp["data"]
-    title = view["title"]
-    cid = view["pages"][0]["cid"]
-
-    # 获取播放地址
-    play_resp = requests.get(
-        "https://api.bilibili.com/x/player/playurl",
-        params={"bvid": bvid, "cid": cid, "qn": 80, "fnval": 16},
-        headers=headers,
-    ).json()
-
-    if play_resp.get("code") != 0:
-        print("[错误] 获取播放地址失败：", play_resp)
-        return
-
-    play = play_resp["data"]
-    video_url = play["dash"]["video"][0]["baseUrl"]
-    audio_url = play["dash"]["audio"][0]["baseUrl"]
-
-    safe_title = re.sub(r'[\\/:*?"<>|]', "_", title)
-    os.makedirs(safe_title, exist_ok=True)
-
-    video_file = os.path.join(safe_title, "video.m4s")
-    audio_file = os.path.join(safe_title, "audio.m4s")
-    output_file = os.path.join(safe_title, safe_title + ".mp4")
-
-    download_file(video_url, video_file, cookie)
-    download_file(audio_url, audio_file, cookie)
-
-    merge_av(video_file, audio_file, output_file)
-
-    print(f"[完成] {output_file}")
 
 
 # -----------------------------
 # 扫描收藏夹
 # -----------------------------
-def scan_fav(cookie: str):
+
+import re
+import httpx
+import hashlib
+import time
+
+async def get_wbi_key(client):
+    resp = await client.get("https://api.bilibili.com/x/web-interface/nav")
+    data = resp.json()
+    img_url = data["data"]["wbi_img"]["img_url"]
+    sub_url = data["data"]["wbi_img"]["sub_url"]
+
+    img_key = img_url.split("/")[-1].split(".")[0]
+    sub_key = sub_url.split("/")[-1].split(".")[0]
+
+    return img_key + sub_key
+
+def wbi_sign(params: dict, wbi_key: str):
+    # 1. 添加 wts
+    params["wts"] = int(time.time())
+
+    # 2. 参数按 key 排序
+    sorted_params = "&".join(f"{k}={v}" for k, v in sorted(params.items()))
+
+    # 3. 拼接 key 做 MD5
+    md5 = hashlib.md5()
+    md5.update((sorted_params + wbi_key).encode("utf-8"))
+    params["w_rid"] = md5.hexdigest()
+
+    return params
+
+
+
+async def scan_fav(cookie: str):
     headers = {"Cookie": cookie, **BASE_HEADERS}
 
-    # 获取用户 UID
-    nav_resp = requests.get(
-        "https://api.bilibili.com/x/web-interface/nav", headers=headers
-    ).json()
-    if nav_resp.get("code") != 0:
-        print("[错误] 获取用户信息失败：", nav_resp)
-        return []
+    async with httpx.AsyncClient(headers=headers, timeout=CLIENT_TIMEOUT) as client:
+        # 获取 WBI key
+        wbi_key = await get_wbi_key(client)
 
-    uid = nav_resp["data"]["mid"]
+        # 获取 UID
+        nav_resp = await fetch_json(client, "https://api.bilibili.com/x/web-interface/nav")
+        uid = nav_resp["data"]["mid"]
 
-    # 获取收藏夹列表
-    fav_resp = requests.get(
-        f"https://api.bilibili.com/x/v3/fav/folder/created/list-all?up_mid={uid}",
-        headers=headers,
-    ).json()
+        # 获取收藏夹列表
+        fav_resp = await fetch_json(
+            client,
+            f"https://api.bilibili.com/x/v3/fav/folder/created/list-all?up_mid={uid}",
+        )
+        favs = fav_resp["data"]["list"]
 
-    if fav_resp.get("code") != 0:
-        print("[错误] 获取收藏夹列表失败：", fav_resp)
-        return []
+        new_bvs = []
+        seen = set()
 
-    favs = fav_resp["data"]["list"]
+        for fav in favs:
+            media_id = fav["id"]
+            pn = 1
 
-    new_bvs = []
+            while True:
+                params = {"media_id": media_id, "pn": pn, "ps": 20}
+                params = wbi_sign(params, wbi_key)
 
-    for fav in favs:
-        media_id = fav["id"]
-        pn = 1
+                resp = await fetch_json(
+                    client,
+                    "https://api.bilibili.com/x/v3/fav/resource/list",
+                    params=params,
+                )
 
-        while True:
-            url = "https://api.bilibili.com/x/v3/fav/resource/list"
-            resp = requests.get(
-                url,
-                params={"media_id": media_id, "pn": pn, "ps": 20},
-                headers=headers,
-            ).json()
+                medias = resp["data"]["medias"]
+                if not medias:
+                    break
 
-            if resp.get("code") != 0:
-                print("[错误] 获取收藏夹内容失败：", resp)
-                break
+                for m in medias:
+                    bv = m["bv_id"]
+                    if bv and bv not in seen:
+                        seen.add(bv)
+                        if not await r.sismember(REDIS_KEY, bv):
+                            new_bvs.append(bv)
 
-            medias = resp["data"]["medias"]
-            if not medias:
-                break
-
-            for m in medias:
-                bv = m["bv_id"]
-                if not r.sismember(REDIS_KEY, bv):
-                    new_bvs.append(bv)
-
-            pn += 1
+                pn += 1
 
     return new_bvs
 
 
+async def enqueue_ready_video(bvid: str) -> None:
+    """把待下载视频写入 Redis ready 集合，并初始化下载状态字段。"""
+    now = now_iso()
+    await r.hset(
+        video_state_key(bvid),
+        mapping={
+            "bvid": bvid,
+            "download": "ready",
+            "created_at": now,
+            "updated_at": now,
+        },
+    )
+    await r.sadd(READY_REDIS_KEY, bvid)
+
+
 @app.get("/scan_fav")
-def scan_fav_api():
-    cookie = load_cookie()
+async def scan_fav_api():
+    """扫描收藏夹并把尚未处理的新视频写入 Redis ready 队列。"""
+    cookie = await load_cookie()
     if not cookie:
         return {"error": "not logged in"}
 
-    new_bvs = scan_fav(cookie)
+    lock_token = await acquire_scan_lock()
+    if not lock_token:
+        return {
+            "status": "busy",
+            "message": "scan_fav 正在扫描中，请稍后再试",
+        }
 
-    downloaded = []
-    for bv in new_bvs:
-        download_bv(bv, cookie)
-        r.sadd(REDIS_KEY, bv)
-        downloaded.append(bv)
-        break  # 先测试一个，确认没问题再批量下载
+    try:
+        try:
+            new_bvs = await scan_fav(cookie)
+        except httpx.HTTPStatusError as exc:
+            return {
+                "status": "failed",
+                "message": f"扫描收藏夹失败，B站返回 HTTP {exc.response.status_code}",
+                "raw": exc.response.text[:200],
+            }
 
-    return {"downloaded": downloaded}
+        queued = []
+        for bv in new_bvs:
+            await enqueue_ready_video(bv)
+            queued.append(bv)
+
+        return {"status": "ok", "queued": queued, "ready_count": len(queued)}
+    finally:
+        await release_scan_lock(lock_token)
 
 
 # -----------------------------
 # Cookie 保活接口（定期调用）
 # -----------------------------
 @app.get("/keep_alive")
-def keep_alive():
+async def keep_alive():
     """
     你可以用定时任务定期请求这个接口，
     它会访问一次需要登录的接口，帮助 Cookie 续期。
     """
-    cookie = load_cookie()
+    cookie = await load_cookie()
     if not cookie:
         return {"error": "not logged in"}
 
     headers = {"Cookie": cookie, **BASE_HEADERS}
-    resp = requests.get("https://api.bilibili.com/x/web-interface/nav", headers=headers)
+    async with httpx.AsyncClient(
+        headers=headers,
+        follow_redirects=True,
+        timeout=CLIENT_TIMEOUT,
+    ) as client:
+        response = await client.get("https://api.bilibili.com/x/web-interface/nav")
 
     try:
-        data = resp.json()
+        data = response.json()
     except Exception:
-        return {"status": "failed", "raw": resp.text[:200]}
+        return {"status": "failed", "raw": response.text[:200]}
 
     if data.get("code") == 0:
         return {"status": "ok", "uname": data["data"]["uname"]}
