@@ -1,36 +1,60 @@
 import asyncio
 import base64
+import hashlib
 import json
+import logging
+import os
 import re
+import time
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from io import BytesIO
+from pathlib import Path
 from secrets import token_hex
 from typing import Any, cast
 
 import httpx
 import qrcode
 import redis.asyncio as redis
+from dotenv import load_dotenv
 from fastapi import BackgroundTasks, FastAPI, HTTPException
 from fastapi.responses import HTMLResponse
 from qrcode import constants as qrcode_constants
 
+load_dotenv()
+
 # -----------------------------
 # 配置
 # -----------------------------
-REDIS_KEY = "bili:downloaded"
-READY_REDIS_KEY = "bili:ready"
-COOKIE_REDIS_KEY = "bili:auth:cookie"
-LOGIN_REDIS_PREFIX = "bili:login:"
-VIDEO_REDIS_PREFIX = "bili:video:"
-SCAN_FAV_LOCK_KEY = "bili:scan_fav:lock"
-SCAN_FAV_LOCK_TTL_SECONDS = 1800
-LOGIN_POLL_INTERVAL_SECONDS = 10
-LOGIN_MAX_POLLS = 5
-LOGIN_KEY_TTL_SECONDS = 600
+REDIS_HOST = os.getenv("REDIS_HOST", "localhost")
+REDIS_PORT = int(os.getenv("REDIS_PORT", "6379"))
+REDIS_DB = int(os.getenv("REDIS_DB", "0"))
+
+REDIS_KEY = os.getenv("REDIS_KEY", "bili:downloaded")
+COOKIE_REDIS_KEY = os.getenv("COOKIE_REDIS_KEY", "bili:auth:cookie")
+LOGIN_REDIS_PREFIX = os.getenv("LOGIN_REDIS_PREFIX", "bili:login:")
+VIDEO_REDIS_PREFIX = os.getenv("VIDEO_REDIS_PREFIX", "bili:video:")
+SCAN_FAV_LOCK_KEY = os.getenv("SCAN_FAV_LOCK_KEY", "bili:scan_fav:lock")
+SCAN_FAV_LOCK_TTL_SECONDS = int(os.getenv("SCAN_FAV_LOCK_TTL_SECONDS", "1800"))
+LOGIN_POLL_INTERVAL_SECONDS = int(os.getenv("LOGIN_POLL_INTERVAL_SECONDS", "10"))
+LOGIN_MAX_POLLS = int(os.getenv("LOGIN_MAX_POLLS", "5"))
+LOGIN_KEY_TTL_SECONDS = int(os.getenv("LOGIN_KEY_TTL_SECONDS", "600"))
 CLIENT_TIMEOUT = httpx.Timeout(30.0, connect=10.0, read=60.0)
 
-r = cast(Any, redis.Redis(host="localhost", port=6379, decode_responses=True))
+LOG_DIR = Path("logs")
+LOG_DIR.mkdir(exist_ok=True)
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[
+        logging.StreamHandler(),
+        logging.FileHandler(LOG_DIR / "bili_auto.log", encoding="utf-8"),
+    ],
+)
+logger = logging.getLogger(__name__)
+
+r = cast(Any, redis.Redis(host=REDIS_HOST, port=REDIS_PORT, db=REDIS_DB, decode_responses=True))
 
 
 @asynccontextmanager
@@ -450,11 +474,6 @@ async def login_poll(qrcode_key: str):
 # 扫描收藏夹
 # -----------------------------
 
-import re
-import httpx
-import hashlib
-import time
-
 async def get_wbi_key(client):
     resp = await client.get("https://api.bilibili.com/x/web-interface/nav")
     data = resp.json()
@@ -482,7 +501,7 @@ def wbi_sign(params: dict, wbi_key: str):
 
 
 
-async def scan_fav(cookie: str):
+async def scan_fav(cookie: str, folder_name: str | None = None) -> list[str]:
     headers = {"Cookie": cookie, **BASE_HEADERS}
 
     async with httpx.AsyncClient(headers=headers, timeout=CLIENT_TIMEOUT) as client:
@@ -499,6 +518,15 @@ async def scan_fav(cookie: str):
             f"https://api.bilibili.com/x/v3/fav/folder/created/list-all?up_mid={uid}",
         )
         favs = fav_resp["data"]["list"]
+
+        # -----------------------------
+        # ⭐ 过滤收藏夹（新增逻辑）
+        # -----------------------------
+        if folder_name:
+            favs = [f for f in favs if f["title"] == folder_name]
+            if not favs:
+                logger.info("未找到名称为《%s》的收藏夹", folder_name)
+                return []
 
         new_bvs = []
         seen = set()
@@ -525,8 +553,12 @@ async def scan_fav(cookie: str):
                     bv = m["bv_id"]
                     if bv and bv not in seen:
                         seen.add(bv)
-                        if not await r.sismember(REDIS_KEY, bv):
-                            new_bvs.append(bv)
+                        if await r.sismember(REDIS_KEY, bv):
+                            continue
+                        download_status = await r.hget(video_state_key(bv), "download")
+                        if download_status in ("ready", "downloading"):
+                            continue
+                        new_bvs.append(bv)
 
                 pn += 1
 
@@ -534,7 +566,7 @@ async def scan_fav(cookie: str):
 
 
 async def enqueue_ready_video(bvid: str) -> None:
-    """把待下载视频写入 Redis ready 集合，并初始化下载状态字段。"""
+    """把待下载视频写入 Redis hash，并初始化下载状态字段。"""
     now = now_iso()
     await r.hset(
         video_state_key(bvid),
@@ -545,11 +577,10 @@ async def enqueue_ready_video(bvid: str) -> None:
             "updated_at": now,
         },
     )
-    await r.sadd(READY_REDIS_KEY, bvid)
 
 
 @app.get("/scan_fav")
-async def scan_fav_api():
+async def scan_fav_api(folder_name: str | None = None):
     """扫描收藏夹并把尚未处理的新视频写入 Redis ready 队列。"""
     cookie = await load_cookie()
     if not cookie:
@@ -564,7 +595,7 @@ async def scan_fav_api():
 
     try:
         try:
-            new_bvs = await scan_fav(cookie)
+            new_bvs = await scan_fav(cookie, folder_name)
         except httpx.HTTPStatusError as exc:
             return {
                 "status": "failed",
@@ -612,6 +643,52 @@ async def keep_alive():
         return {"status": "ok", "uname": data["data"]["uname"]}
     else:
         return {"status": "failed", "data": data}
+
+
+# -----------------------------
+# 健康检查
+# -----------------------------
+@app.get("/health")
+async def health():
+    """检查 Redis 连接、ffmpeg 可用性以及登录状态。"""
+    result: dict = {}
+
+    # Redis 连通性
+    try:
+        await r.ping()
+        result["redis"] = "ok"
+    except Exception as exc:
+        result["redis"] = f"error: {exc}"
+
+    # ffmpeg 可用性
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "ffmpeg", "-version",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, _ = await proc.communicate()
+        first_line = stdout.decode(errors="replace").splitlines()[0] if stdout else ""
+        result["ffmpeg"] = first_line if proc.returncode == 0 else "error: ffmpeg exited non-zero"
+    except FileNotFoundError:
+        result["ffmpeg"] = "error: ffmpeg not found in PATH"
+    except Exception as exc:
+        result["ffmpeg"] = f"error: {exc}"
+
+    # 登录状态
+    cookie = await load_cookie()
+    result["logged_in"] = bool(cookie)
+
+    # B 站接口连通性（不需要登录）
+    try:
+        async with httpx.AsyncClient(headers=BASE_HEADERS, timeout=httpx.Timeout(10.0)) as client:
+            resp = await client.get("https://api.bilibili.com/x/web-interface/nav")
+        result["bilibili_api"] = "ok" if resp.status_code == 200 else f"http {resp.status_code}"
+    except Exception as exc:
+        result["bilibili_api"] = f"error: {exc}"
+
+    overall = "ok" if all(v == "ok" or v is True for v in result.values()) else "degraded"
+    return {"status": overall, **result}
 
 
 # -----------------------------

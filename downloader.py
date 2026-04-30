@@ -1,27 +1,52 @@
 import asyncio
+import logging
 import os
 import re
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, cast
 
 import httpx
 import redis.asyncio as redis
+from dotenv import load_dotenv
 from tqdm import tqdm
 
-REDIS_KEY = "bili:downloaded"
-READY_REDIS_KEY = "bili:ready"
-COOKIE_REDIS_KEY = "bili:auth:cookie"
-VIDEO_REDIS_PREFIX = "bili:video:"
-DOWNLOAD_LOCK_KEY = "bili:download:lock"
-DOWNLOAD_LOCK_TTL_SECONDS = 7200
+load_dotenv()
+
+REDIS_HOST = os.getenv("REDIS_HOST", "localhost")
+REDIS_PORT = int(os.getenv("REDIS_PORT", "6379"))
+REDIS_DB = int(os.getenv("REDIS_DB", "0"))
+
+REDIS_KEY = os.getenv("REDIS_KEY", "bili:downloaded")
+COOKIE_REDIS_KEY = os.getenv("COOKIE_REDIS_KEY", "bili:auth:cookie")
+VIDEO_REDIS_PREFIX = os.getenv("VIDEO_REDIS_PREFIX", "bili:video:")
+DOWNLOAD_LOCK_KEY = os.getenv("DOWNLOAD_LOCK_KEY", "bili:download:lock")
+DOWNLOAD_LOCK_TTL_SECONDS = int(os.getenv("DOWNLOAD_LOCK_TTL_SECONDS", "7200"))
+VIDEO_DONE_TTL_SECONDS = int(os.getenv("VIDEO_DONE_TTL_SECONDS", "10800"))
+MAX_DOWNLOADS_PER_RUN = int(os.getenv("MAX_DOWNLOADS_PER_RUN", "10"))
+DOWNLOAD_INTERVAL_SECONDS = int(os.getenv("DOWNLOAD_INTERVAL_SECONDS", "3"))
 CLIENT_TIMEOUT = httpx.Timeout(30.0, connect=10.0, read=60.0)
+DOWNLOAD_DIR = Path(os.getenv("DOWNLOAD_DIR", "./downloads"))
+
+LOG_DIR = Path("logs")
+LOG_DIR.mkdir(exist_ok=True)
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[
+        logging.StreamHandler(),
+        logging.FileHandler(LOG_DIR / "downloader.log", encoding="utf-8"),
+    ],
+)
+logger = logging.getLogger(__name__)
 
 BASE_HEADERS = {
     "User-Agent": "Mozilla/5.0",
     "Referer": "https://www.bilibili.com",
 }
 
-r = cast(Any, redis.Redis(host="localhost", port=6379, decode_responses=True))
+r = cast(Any, redis.Redis(host=REDIS_HOST, port=REDIS_PORT, db=REDIS_DB, decode_responses=True))
 
 
 def now_iso() -> str:
@@ -56,6 +81,14 @@ def get_stream_url(stream: dict) -> str | None:
     return stream.get("baseUrl") or stream.get("base_url")
 
 
+def sanitize_title(text: str) -> str:
+    """标题/作者名转安全文件名：去除首尾符号，内部符号替换为下划线，合并连续下划线。"""
+    cleaned = re.sub(r'[^\w\u4e00-\u9fff]', '_', text)
+    cleaned = cleaned.strip('_')
+    cleaned = re.sub(r'_+', '_', cleaned)
+    return cleaned or "unknown"
+
+
 def select_best_video_stream(videos: list[dict]) -> dict:
     """按清晰度 ID、分辨率和码率选择最高可用视频流。"""
     return max(
@@ -73,19 +106,19 @@ def select_best_audio_stream(audios: list[dict]) -> dict:
     return max(audios, key=lambda item: int(item.get("bandwidth", 0)))
 
 
-async def download_file(client: httpx.AsyncClient, url: str, filename: str) -> None:
+async def download_file(client: httpx.AsyncClient, url: str, dest: Path) -> None:
     """异步下载单个媒体文件，并保留进度条展示。"""
     async with client.stream("GET", url) as resp:
         resp.raise_for_status()
         total = int(resp.headers.get("content-length", 0))
 
         with (
-            open(filename, "wb") as file_obj,
+            dest.open("wb") as file_obj,
             tqdm(
                 total=total,
                 unit="B",
                 unit_scale=True,
-                desc=os.path.basename(filename),
+                desc=dest.name,
             ) as progress_bar,
         ):
             async for chunk in resp.aiter_bytes(chunk_size=8192):
@@ -94,18 +127,18 @@ async def download_file(client: httpx.AsyncClient, url: str, filename: str) -> N
                     progress_bar.update(len(chunk))
 
 
-async def merge_av(video_file: str, audio_file: str, output_file: str) -> None:
+async def merge_av(video_file: Path, audio_file: Path, output_file: Path) -> None:
     """使用异步子进程调用 ffmpeg 合并音视频。"""
     process = await asyncio.create_subprocess_exec(
         "ffmpeg",
         "-y",
         "-i",
-        video_file,
+        str(video_file),
         "-i",
-        audio_file,
+        str(audio_file),
         "-c",
         "copy",
-        output_file,
+        str(output_file),
         stdout=asyncio.subprocess.DEVNULL,
         stderr=asyncio.subprocess.DEVNULL,
     )
@@ -121,7 +154,7 @@ async def mark_video_status(bvid: str, mapping: dict[str, str]) -> None:
 
 async def download_bv(bvid: str, cookie: str) -> None:
     """下载指定 BV 视频，并自动选择当前可用的最高画质。"""
-    print(f"[下载] BV: {bvid}")
+    logger.info("开始下载 BV: %s", bvid)
 
     headers = {"Cookie": cookie, **BASE_HEADERS}
 
@@ -141,6 +174,7 @@ async def download_bv(bvid: str, cookie: str) -> None:
 
         view = view_resp["data"]
         title = view["title"]
+        author = view["owner"]["name"]
         cid = view["pages"][0]["cid"]
 
         # 先请求高档清晰度，再从服务端返回的候选流中选最高一档。
@@ -168,18 +202,22 @@ async def download_bv(bvid: str, cookie: str) -> None:
         if not video_url or not audio_url:
             raise RuntimeError(f"无法解析音视频下载地址：{play_resp}")
 
-        safe_title = re.sub(r'[\\/:*?"<>|]', "_", title)
-        os.makedirs(safe_title, exist_ok=True)
+        safe_author = sanitize_title(author)
+        clean_title = sanitize_title(title)
+        video_dir = DOWNLOAD_DIR / safe_author
+        video_dir.mkdir(parents=True, exist_ok=True)
 
-        video_file = os.path.join(safe_title, "video.m4s")
-        audio_file = os.path.join(safe_title, "audio.m4s")
-        output_file = os.path.join(safe_title, safe_title + ".mp4")
+        video_file = video_dir / f"{bvid}_video.m4s"
+        audio_file = video_dir / f"{bvid}_audio.m4s"
+        output_file = video_dir / f"{clean_title}.mp4"
 
         await download_file(client, video_url, video_file)
         await download_file(client, audio_url, audio_file)
 
     await merge_av(video_file, audio_file, output_file)
-    print(f"[完成] {output_file}")
+    video_file.unlink(missing_ok=True)
+    audio_file.unlink(missing_ok=True)
+    logger.info("下载完成: %s", output_file)
 
 
 async def acquire_download_lock() -> bool:
@@ -193,16 +231,26 @@ async def release_download_lock() -> None:
 
 
 async def process_ready_queue() -> None:
-    """扫描 Redis ready 集合，逐个下载，并更新 download 字段。"""
+    """扫描 bili:video:* hash，找出 download=ready 的条目逐个下载，每次最多处理 MAX_DOWNLOADS_PER_RUN 个。"""
     cookie = await load_cookie()
     if not cookie:
         raise RuntimeError("未找到登录 Cookie，请先完成扫码登录")
 
-    ready_bvs = sorted(await r.smembers(READY_REDIS_KEY))
+    ready_bvs: list[str] = []
+    async for key in r.scan_iter(f"{VIDEO_REDIS_PREFIX}*"):
+        status = await r.hget(key, "download")
+        if status == "ready":
+            ready_bvs.append(key[len(VIDEO_REDIS_PREFIX):])
+    ready_bvs.sort()
+
     if not ready_bvs:
-        print("[下载] ready 队列为空")
+        logger.info("ready 队列为空，无需下载")
         return
-    for bvid in ready_bvs:
+
+    batch = ready_bvs[:MAX_DOWNLOADS_PER_RUN]
+    logger.info("本次共 %d 个待下载视频，最多处理 %d 个", len(ready_bvs), len(batch))
+
+    for idx, bvid in enumerate(batch):
         await mark_video_status(
             bvid,
             {
@@ -224,11 +272,12 @@ async def process_ready_queue() -> None:
                     "updated_at": now_iso(),
                 },
             )
-            print(f"[错误] {bvid} 下载失败：{exc}")
+            logger.error("%s 下载失败：%s", bvid, exc)
+            if idx < len(batch) - 1:
+                await asyncio.sleep(DOWNLOAD_INTERVAL_SECONDS)
             continue
 
         await r.sadd(REDIS_KEY, bvid)
-        await r.srem(READY_REDIS_KEY, bvid)
         await mark_video_status(
             bvid,
             {
@@ -239,13 +288,17 @@ async def process_ready_queue() -> None:
                 "updated_at": now_iso(),
             },
         )
+        await r.expire(video_state_key(bvid), VIDEO_DONE_TTL_SECONDS)
+
+        if idx < len(batch) - 1:
+            await asyncio.sleep(DOWNLOAD_INTERVAL_SECONDS)
 
 
 async def async_main() -> None:
     """下载脚本入口：消费 ready 队列并更新 Redis 状态。"""
     locked = await acquire_download_lock()
     if not locked:
-        print("[下载] 已有下载任务在执行，跳过本次运行")
+        logger.info("已有下载任务在执行，跳过本次运行")
         return
 
     try:

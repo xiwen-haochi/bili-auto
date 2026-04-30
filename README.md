@@ -1,39 +1,145 @@
 # bili-auto
 
-#### 介绍
-{**以下是 Gitee 平台说明，您可以替换此简介**
-Gitee 是 OSCHINA 推出的基于 Git 的代码托管平台（同时支持 SVN）。专为开发者提供稳定、高效、安全的云端软件开发协作平台
-无论是个人、团队、或是企业，都能够用 Gitee 实现代码托管、项目管理、协作开发。企业项目请看 [https://gitee.com/enterprises](https://gitee.com/enterprises)}
+自动扫描 B 站收藏夹、将新视频入队，并以最高画质下载合并为 MP4 的异步工具。
 
-#### 软件架构
-软件架构说明
+## 功能
 
+- **扫码登录**：浏览器打开页面即可扫码，Cookie 存入 Redis，无需本地文件
+- **收藏夹扫描**：调用 `/scan_fav` 接口自动扫描所有（或指定）收藏夹，增量入队新视频
+- **最高画质下载**：DASH 流优先选最高分辨率 + 最高码率，支持 4K
+- **音视频合并**：ffmpeg 合并后自动删除临时 m4s 文件
+- **目录结构**：`下载目录/作者名/标题.mp4`
+- **Redis 状态追踪**：每个视频有独立 hash 记录下载状态（ready / downloading / done / failed），完成后 3 小时自动过期
+- **下载限流**：每次最多处理 10 个视频，每个间隔 3 秒，防止封禁
+- **并发保护**：扫描锁 + 下载锁，防止重复执行
+- **日志**：终端 + 文件双输出（`logs/bili_auto.log`、`logs/downloader.log`）
 
-#### 安装教程
+## 依赖
 
-1.  xxxx
-2.  xxxx
-3.  xxxx
+- Python 3.12+
+- Redis
+- ffmpeg（需在系统 PATH 中）
 
-#### 使用说明
+## 安装
 
-1.  xxxx
-2.  xxxx
-3.  xxxx
+```bash
+# 安装依赖
+uv sync
+# 或
+pip install -e .
+```
 
-#### 参与贡献
+## 配置
 
-1.  Fork 本仓库
-2.  新建 Feat_xxx 分支
-3.  提交代码
-4.  新建 Pull Request
+复制示例文件并按需修改：
 
+```bash
+cp .env.example .env
+```
 
-#### 特技
+| 变量 | 默认值 | 说明 |
+|---|---|---|
+| `REDIS_HOST` | `localhost` | Redis 主机 |
+| `REDIS_PORT` | `6379` | Redis 端口 |
+| `REDIS_DB` | `0` | Redis 数据库编号 |
+| `DOWNLOAD_DIR` | `./downloads` | 视频保存根目录 |
+| `MAX_DOWNLOADS_PER_RUN` | `10` | 每次 downloader 最多下载数 |
+| `DOWNLOAD_INTERVAL_SECONDS` | `3` | 视频下载间隔（秒） |
+| `VIDEO_DONE_TTL_SECONDS` | `10800` | done 状态 hash 过期时间（秒） |
+| `LOGIN_MAX_POLLS` | `5` | 登录轮询最大次数 |
+| `LOGIN_POLL_INTERVAL_SECONDS` | `10` | 登录轮询间隔（秒） |
 
-1.  使用 Readme\_XXX.md 来支持不同的语言，例如 Readme\_en.md, Readme\_zh.md
-2.  Gitee 官方博客 [blog.gitee.com](https://blog.gitee.com)
-3.  你可以 [https://gitee.com/explore](https://gitee.com/explore) 这个地址来了解 Gitee 上的优秀开源项目
-4.  [GVP](https://gitee.com/gvp) 全称是 Gitee 最有价值开源项目，是综合评定出的优秀开源项目
-5.  Gitee 官方提供的使用手册 [https://gitee.com/help](https://gitee.com/help)
-6.  Gitee 封面人物是一档用来展示 Gitee 会员风采的栏目 [https://gitee.com/gitee-stars/](https://gitee.com/gitee-stars/)
+## 使用
+
+### 1. 启动 API 服务
+
+```bash
+python bili_auto.py
+# 或
+uvicorn bili_auto:app --host 0.0.0.0 --port 8000
+```
+
+### 2. 扫码登录
+
+浏览器打开 `http://localhost:8000/login_qrcode`，用 B 站 App 扫码，Cookie 自动写入 Redis。
+
+### 3. 扫描收藏夹
+
+```bash
+# 扫描全部收藏夹
+curl http://localhost:8000/scan_fav
+
+# 扫描指定收藏夹
+curl "http://localhost:8000/scan_fav?folder_name=我的收藏"
+```
+
+### 4. 执行下载
+
+```bash
+python downloader.py
+```
+
+每次运行最多下载 `MAX_DOWNLOADS_PER_RUN` 个视频。可配合 cron 定时执行：
+
+```cron
+# 每小时扫描一次收藏夹
+0 * * * * curl -s http://localhost:8000/scan_fav
+
+# 每小时下载一次队列
+30 * * * * cd /path/to/bili-auto && .venv/bin/python downloader.py
+```
+
+### 5. Cookie 保活（可选）
+
+```bash
+curl http://localhost:8000/keep_alive
+```
+
+### 6. 健康检查
+
+```bash
+curl http://localhost:8000/health
+```
+
+返回示例：
+
+```json
+{
+  "status": "ok",
+  "redis": "ok",
+  "ffmpeg": "ffmpeg version 7.1 Copyright (c) 2000-2024 the FFmpeg developers",
+  "logged_in": true,
+  "bilibili_api": "ok"
+}
+```
+
+| 字段 | 说明 |
+|---|---|
+| `status` | 整体状态：`ok` 全部正常，`degraded` 有项异常 |
+| `redis` | Redis 连通性（`ok` 或错误信息） |
+| `ffmpeg` | ffmpeg 版本行（`ok` 状态下）或错误信息 |
+| `logged_in` | 是否已有登录 Cookie |
+| `bilibili_api` | B 站接口是否可达 |
+
+## 项目结构
+
+```
+bili-auto/
+├── bili_auto.py      # FastAPI 服务：登录、扫描、Cookie 管理
+├── downloader.py     # 独立下载脚本：消费 Redis 队列
+├── .env              # 本地配置（不提交）
+├── .env.example      # 配置示例
+├── logs/             # 日志目录（自动创建）
+└── downloads/        # 视频下载目录（自动创建）
+```
+
+## Redis 数据结构
+
+| Key | 类型 | 说明 |
+|---|---|---|
+| `bili:downloaded` | Set | 已完成下载的 BV 号 |
+| `bili:auth:cookie` | String | 当前登录 Cookie |
+| `bili:video:{bvid}` | Hash | 单视频状态（download: ready/downloading/done/failed） |
+| `bili:login:{key}` | Hash | 二维码登录状态，10 分钟过期 |
+| `bili:scan_fav:lock` | String | 扫描锁 |
+| `bili:download:lock` | String | 下载锁 |
