@@ -844,6 +844,68 @@ async def check_up_new_video(uids: list[int] = Query(...)):
 
     return {"status": "ok", "result": summary}
 
+# -----------------------------
+# 获取关注的所有up
+# -----------------------------
+
+async def fetch_followings(cookie: str):
+    """
+    获取当前账号关注的所有 UP 主
+    返回：[{uid, name, sex}]
+    """
+    headers = {
+        "Cookie": cookie,
+        "User-Agent": "Mozilla/5.0",
+        "Referer": "https://space.bilibili.com",
+    }
+
+    async with httpx.AsyncClient(headers=headers, timeout=10) as client:
+        # 1. 获取自己的 UID
+        nav = await client.get("https://api.bilibili.com/x/web-interface/nav")
+        nav_data = nav.json()
+        if nav_data.get("code") != 0:
+            return {"error": "无法获取用户信息", "raw": nav_data}
+
+        uid = nav_data["data"]["mid"]
+
+        # 2. 分页获取关注列表
+        page = 1
+        results = []
+
+        while True:
+            resp = await client.get(
+                "https://api.bilibili.com/x/relation/followings",
+                params={"vmid": uid, "pn": page, "ps": 50, "order": "desc"},
+            )
+            data = resp.json()
+
+            if data.get("code") != 0:
+                return {"error": "获取关注列表失败", "raw": data}
+
+            list_data = data["data"].get("list") or []
+            if not list_data:
+                break
+
+            for item in list_data:
+                results.append({
+                    "uid": item["mid"],
+                    "name": item["uname"],
+                })
+
+            page += 1
+
+        return results
+    
+@app.get("/my_followings")
+async def my_followings():
+    cookie = await load_cookie()
+    if not cookie:
+        return {"error": "not logged in"}
+
+    data = await fetch_followings(cookie)
+    return data
+
+
 
 # -----------------------------
 # Cookie 保活接口（定期调用）
