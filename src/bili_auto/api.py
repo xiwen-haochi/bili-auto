@@ -21,6 +21,12 @@ from fastapi import BackgroundTasks, FastAPI, HTTPException
 from fastapi.responses import HTMLResponse
 from qrcode import constants as qrcode_constants
 
+from bili_auto.downloader import (
+    DOWNLOAD_LOCK_KEY,
+    async_main as _run_downloader,
+    r as downloader_r,
+)
+
 load_dotenv()
 
 # -----------------------------
@@ -64,6 +70,7 @@ async def lifespan(_: FastAPI):
         yield
     finally:
         await r.aclose()
+        await downloader_r.aclose()
 
 
 app = FastAPI(lifespan=lifespan)
@@ -611,6 +618,30 @@ async def scan_fav_api(folder_name: str | None = None):
         return {"status": "ok", "queued": queued, "ready_count": len(queued)}
     finally:
         await release_scan_lock(lock_token)
+
+
+# -----------------------------
+# 下载触发接口
+# -----------------------------
+@app.post("/download")
+async def trigger_download(background_tasks: BackgroundTasks):
+    """
+    手动触发下载队列消费。
+    若下载锁已占用，返回 busy；否则启动后台下载任务。
+    """
+    lock_held = await r.exists(DOWNLOAD_LOCK_KEY)
+    if lock_held:
+        lock_since = await r.get(DOWNLOAD_LOCK_KEY)
+        return {"status": "busy", "message": "下载任务正在执行中", "lock_since": lock_since}
+    background_tasks.add_task(_run_downloader)
+    return {"status": "ok", "message": "下载任务已启动"}
+
+
+@app.get("/download/status")
+async def download_status():
+    """Query 下载锁状态，可用于确认下载任务是否正在运行。"""
+    lock_since = await r.get(DOWNLOAD_LOCK_KEY)
+    return {"running": bool(lock_since), "lock_since": lock_since}
 
 
 # -----------------------------

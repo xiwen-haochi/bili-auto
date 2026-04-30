@@ -88,13 +88,26 @@ curl "http://localhost:8000/scan_fav?folder_name=我的收藏"
 bili-downloader
 ```
 
-每次运行最多下载 `MAX_DOWNLOADS_PER_RUN` 个视频。可配合 cron 定时执行：
+每次运行最多下载 `MAX_DOWNLOADS_PER_RUN` 个视频。也可通过 API 服务触发，无需启动独立进程：
+
+```bash
+# 触发下载（后台执行，立即返回）
+curl -X POST http://localhost:8000/download
+
+# 查询下载是否正在运行
+curl http://localhost:8000/download/status
+```
+
+可配合 cron 定时执行：
 
 ```cron
 # 每小时扫描一次收藏夹
 0 * * * * curl -s http://localhost:8000/scan_fav
 
-# 每小时下载一次队列
+# 每小时触发一次下载（通过 API）
+30 * * * * curl -s -X POST http://localhost:8000/download
+
+# 或直接运行 CLI（二选一）
 30 * * * * /path/to/.venv/bin/bili-downloader
 ```
 

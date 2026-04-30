@@ -295,7 +295,7 @@ async def process_ready_queue() -> None:
 
 
 async def async_main() -> None:
-    """下载脚本入口：消费 ready 队列并更新 Redis 状态。"""
+    """消费 ready 队列并更新 Redis 状态。可单独运行也可由 API 服务触发。"""
     locked = await acquire_download_lock()
     if not locked:
         logger.info("已有下载任务在执行，跳过本次运行")
@@ -305,12 +305,18 @@ async def async_main() -> None:
         await process_ready_queue()
     finally:
         await release_download_lock()
-        await r.aclose()
 
 
 def main() -> None:
     """CLI 入口：运行下载队列消费脚本。"""
-    asyncio.run(async_main())
+
+    async def _run() -> None:
+        try:
+            await async_main()
+        finally:
+            await r.aclose()
+
+    asyncio.run(_run())
 
 
 if __name__ == "__main__":
