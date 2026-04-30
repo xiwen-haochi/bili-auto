@@ -48,9 +48,13 @@ cp .env.example .env
 
 | 变量 | 默认值 | 说明 |
 |---|---|---|
+| `SERVICE_HOST` | `0.0.0.0` | 服务监听 IP |
+| `SERVICE_PORT` | `8000` | 服务监听端口 |
 | `REDIS_HOST` | `localhost` | Redis 主机 |
 | `REDIS_PORT` | `6379` | Redis 端口 |
 | `REDIS_DB` | `0` | Redis 数据库编号 |
+| `REDIS_PASSWORD` | 无 | Redis 密码（不填则不鉴权） |
+| `API_KEY` | 无 | API 鉴权密钥，所有请求须携带 `X-API-Key` header |
 | `DOWNLOAD_DIR` | `./downloads` | 视频保存根目录 |
 | `MAX_DOWNLOADS_PER_RUN` | `10` | 每次 downloader 最多下载数 |
 | `DOWNLOAD_INTERVAL_SECONDS` | `3` | 视频下载间隔（秒） |

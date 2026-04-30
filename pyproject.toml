@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "bili-auto"
-version = "0.1.3"
+version = "0.1.4"
 description = "Bilibili auto-download service: QR login, favorites scanning, async download with Redis queue"
 readme = "README.md"
 license = { text = "MIT" }
