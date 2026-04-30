@@ -38,14 +38,6 @@ pip install bili-auto
 uv add bili-auto
 ```
 
-**从源码安装（开发模式）：**
-
-```bash
-git clone https://github.com/yourname/bili-auto.git
-cd bili-auto
-uv sync
-```
-
 ## 配置
 
 复制示例文件并按需修改：
