@@ -106,16 +106,49 @@ curl http://localhost:8000/download/status
 
 ```cron
 # 每小时扫描一次收藏夹
-0 * * * * curl -s http://localhost:8000/scan_fav
+0 * * * * /home/ubuntu/auto-bili/scripts/scan_fav.sh
 
-# 每小时触发一次下载（通过 API）
-30 * * * * curl -s -X POST http://localhost:8000/download
+# 每 30 分钟检查一次 UP 主新视频
+*/30 * * * * /home/ubuntu/auto-bili/scripts/check_up_new_video.sh
 
-# 或直接运行 CLI（二选一）
-30 * * * * /path/to/.venv/bin/bili-downloader
+# 每小时触发一次下载
+30 * * * * /home/ubuntu/auto-bili/scripts/download.sh
+
+# 每 6 小时保活一次（内置 50% 随机概率）
+0 */6 * * * /home/ubuntu/auto-bili/scripts/keep_alive.sh
 ```
 
-### 5. Cookie 保活（可选）
+### 5. UP 主动态监控
+
+**检查多个 UP 主是否有新视频（推荐定时调用）：**
+
+```bash
+# 编辑脚本，填入要监控的 UID
+nano scripts/check_up_new_video.sh
+
+# 执行
+./scripts/check_up_new_video.sh
+```
+
+或直接调用接口：
+
+```bash
+curl "http://localhost:8000/check_up_new_video?uids=123456&uids=789012" \
+  -H "X-API-Key: YOUR_KEY"
+```
+
+逻辑：首次见到该 UID 时记录最新 `dynamic_id`；后续调用若 `dynamic_id` 变化则将新 BV 写入下载队列。
+
+**获取指定 UP 主全部历史视频动态并入队：**
+
+```bash
+curl "http://localhost:8000/up_video_dynamic_all?uid=123456" \
+  -H "X-API-Key: YOUR_KEY"
+```
+
+自动翻页获取全部视频动态，过滤已完成/已入队的 BV 后批量写入下载队列。
+
+### 6. Cookie 保活（可选）
 
 ```bash
 curl http://localhost:8000/keep_alive
@@ -196,8 +229,13 @@ bili-auto/
 ├── src/
 │   └── bili_auto/
 │       ├── __init__.py
-│       ├── api.py          # FastAPI 服务：登录、扫描、Cookie 管理
+│       ├── api.py          # FastAPI 服务：登录、扫描、Cookie 管理、动态监控
 │       └── downloader.py   # 独立下载脚本：消费 Redis 队列
+├── scripts/
+│   ├── scan_fav.sh         # 扫描收藏夹（默认：测试收藏）
+│   ├── download.sh         # 触发下载任务
+│   ├── keep_alive.sh       # Cookie 保活（50% 随机概率）
+│   └── check_up_new_video.sh  # UP 主新视频检测
 ├── .env                    # 本地配置（不提交）
 ├── .env.example            # 配置示例
 ├── pyproject.toml
@@ -215,3 +253,4 @@ bili-auto/
 | `bili:login:{key}` | Hash | 二维码登录状态，10 分钟过期 |
 | `bili:scan_fav:lock` | String | 扫描锁 |
 | `bili:download:lock` | String | 下载锁 |
+| `bili:up:dynamic:{uid}` | String | UP 主最新视频动态 id_str，用于检测更新 |

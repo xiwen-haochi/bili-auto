@@ -17,7 +17,7 @@ import httpx
 import qrcode
 import redis.asyncio as redis
 from dotenv import load_dotenv
-from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Security
+from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Query, Security
 from fastapi.responses import HTMLResponse
 from fastapi.security.api_key import APIKeyHeader
 from qrcode import constants as qrcode_constants
@@ -48,6 +48,7 @@ SCAN_FAV_LOCK_TTL_SECONDS = int(os.getenv("SCAN_FAV_LOCK_TTL_SECONDS", "1800"))
 LOGIN_POLL_INTERVAL_SECONDS = int(os.getenv("LOGIN_POLL_INTERVAL_SECONDS", "10"))
 LOGIN_MAX_POLLS = int(os.getenv("LOGIN_MAX_POLLS", "5"))
 LOGIN_KEY_TTL_SECONDS = int(os.getenv("LOGIN_KEY_TTL_SECONDS", "600"))
+UP_DYNAMIC_PREFIX = os.getenv("UP_DYNAMIC_PREFIX", "bili:up:dynamic:")
 CLIENT_TIMEOUT = httpx.Timeout(30.0, connect=10.0, read=60.0)
 
 LOG_DIR = Path("logs")
@@ -710,6 +711,7 @@ async def fetch_all_up_video_dynamic(uid: int, cookie: str):
 
                 results.append({
                     "type": "video",
+                    "dynamic_id": item["id_str"],
                     "title": archive["title"],
                     "bv": archive["bvid"],
                     "cover": archive["cover"],
@@ -727,12 +729,27 @@ async def fetch_all_up_video_dynamic(uid: int, cookie: str):
 
 @app.get("/up_video_dynamic_all")
 async def up_video_dynamic_all(uid: int):
+    """获取指定 UP 主的全部视频动态，并将 BV 写入待下载队列。"""
     cookie = await load_cookie()
     if not cookie:
         return {"error": "not logged in"}
 
     data = await fetch_all_up_video_dynamic(uid, cookie)
-    return data
+    if isinstance(data, dict) and "error" in data:
+        return data
+
+    queued = []
+    for item in data:
+        bv = item["bv"]
+        if await r.sismember(REDIS_KEY, bv):
+            continue
+        download_status = await r.hget(video_state_key(bv), "download")
+        if download_status in ("ready", "downloading", "done"):
+            continue
+        await enqueue_ready_video(bv)
+        queued.append(bv)
+
+    return {"status": "ok", "uid": uid, "queued": queued, "total_fetched": len(data)}
 
 # -----------------------------
 # 获取指定用户的最新动态
@@ -785,24 +802,47 @@ async def fetch_latest_up_video_dynamic(uid: int, cookie: str):
     return None
 
 @app.get("/check_up_new_video")
-async def check_up_new_video(uid: int):
+async def check_up_new_video(uids: list[int] = Query(...)):
+    """
+    检查多个 UP 主是否有新视频动态。
+    - 首次见到该 UP：记录 id_str，入队 BV
+    - id_str 未变化：跳过
+    - id_str 有变化：更新 id_str，入队新 BV
+    """
     cookie = await load_cookie()
     if not cookie:
         return {"error": "not logged in"}
 
-    latest = await fetch_latest_up_video_dynamic(uid, cookie)
-    if not latest:
-        return {"error": "获取失败"}
+    summary: dict = {}
+    for uid in uids:
+        latest = await fetch_latest_up_video_dynamic(uid, cookie)
+        if not latest:
+            summary[str(uid)] = {"error": "获取失败"}
+            continue
 
-    # dynamic_id = latest["dynamic_id"]
+        dynamic_id: str = latest["dynamic_id"]
+        bv: str = latest["bv"]
+        redis_key = f"{UP_DYNAMIC_PREFIX}{uid}"
+        stored_id: str | None = await r.get(redis_key)
 
-    # # 已处理过
-    # if await r.sismember("bili:dynamic:processed", dynamic_id):
-    #     return {"new": False}
+        if stored_id is None:
+            await r.set(redis_key, dynamic_id)
+            # await enqueue_ready_video(bv)
+            summary[str(uid)] = {"new": True, "action": "first_seen", "bv": bv, "dynamic_id": dynamic_id}
+        elif stored_id == dynamic_id:
+            summary[str(uid)] = {"new": False, "action": "no_change"}
+        else:
+            await r.set(redis_key, dynamic_id)
+            await enqueue_ready_video(bv)
+            summary[str(uid)] = {
+                "new": True,
+                "action": "updated",
+                "bv": bv,
+                "dynamic_id": dynamic_id,
+                "prev_dynamic_id": stored_id,
+            }
 
-    # # 新动态
-    # await r.sadd("bili:dynamic:processed", dynamic_id)
-    return {"new": True, "data": latest}
+    return {"status": "ok", "result": summary}
 
 
 # -----------------------------
