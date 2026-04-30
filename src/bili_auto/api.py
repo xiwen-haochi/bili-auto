@@ -17,8 +17,9 @@ import httpx
 import qrcode
 import redis.asyncio as redis
 from dotenv import load_dotenv
-from fastapi import BackgroundTasks, FastAPI, HTTPException
+from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Security
 from fastapi.responses import HTMLResponse
+from fastapi.security.api_key import APIKeyHeader
 from qrcode import constants as qrcode_constants
 
 from bili_auto.downloader import (
@@ -35,6 +36,8 @@ load_dotenv()
 REDIS_HOST = os.getenv("REDIS_HOST", "localhost")
 REDIS_PORT = int(os.getenv("REDIS_PORT", "6379"))
 REDIS_DB = int(os.getenv("REDIS_DB", "0"))
+REDIS_PASSWORD = os.getenv("REDIS_PASSWORD") or None
+API_KEY = os.getenv("API_KEY", "")
 
 REDIS_KEY = os.getenv("REDIS_KEY", "bili:downloaded")
 COOKIE_REDIS_KEY = os.getenv("COOKIE_REDIS_KEY", "bili:auth:cookie")
@@ -60,7 +63,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-r = cast(Any, redis.Redis(host=REDIS_HOST, port=REDIS_PORT, db=REDIS_DB, decode_responses=True))
+r = cast(Any, redis.Redis(host=REDIS_HOST, port=REDIS_PORT, db=REDIS_DB, password=REDIS_PASSWORD, decode_responses=True))
 
 
 @asynccontextmanager
@@ -73,7 +76,19 @@ async def lifespan(_: FastAPI):
         await downloader_r.aclose()
 
 
-app = FastAPI(lifespan=lifespan)
+# -----------------------------
+# API 鉴权
+# -----------------------------
+_api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
+
+
+async def verify_api_key(key: str | None = Security(_api_key_header)) -> None:
+    """全局依赖：API_KEY 已配置时，校验请求头中的 X-API-Key。"""
+    if API_KEY and key != API_KEY:
+        raise HTTPException(status_code=401, detail="Invalid or missing API key")
+
+
+app = FastAPI(lifespan=lifespan, dependencies=[Depends(verify_api_key)])
 
 BASE_HEADERS = {
     "User-Agent": "Mozilla/5.0",
