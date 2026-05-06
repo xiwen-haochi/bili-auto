@@ -24,6 +24,7 @@ from qrcode import constants as qrcode_constants
 
 from bili_auto.downloader import (
     DOWNLOAD_LOCK_KEY,
+    DOWNLOAD_MODE,
     async_main as _run_downloader,
     r as downloader_r,
 )
@@ -641,23 +642,40 @@ async def scan_fav_api(folder_name: str | None = None):
 # -----------------------------
 @app.post("/download")
 async def trigger_download(background_tasks: BackgroundTasks):
-    """
-    手动触发下载队列消费。
-    若下载锁已占用，返回 busy；否则启动后台下载任务。
+    """手动触发下载队列消费。
+
+    执行模式由环境变量 DOWNLOAD_MODE 控制：
+      bg   （默认）：将下载注册为 FastAPI BackgroundTask，接口立即返回。
+      sync          ：在当前请求内 await 下载完成，接口等待全部视频处理结束后才返回。
+
+    若下载锁已占用，直接返回 busy 状态及当前进度。
     """
     lock_held = await r.exists(DOWNLOAD_LOCK_KEY)
     if lock_held:
-        lock_since = await r.get(DOWNLOAD_LOCK_KEY)
-        return {"status": "busy", "message": "下载任务正在执行中", "lock_since": lock_since}
+        progress = await r.get(DOWNLOAD_LOCK_KEY)
+        return {"status": "busy", "message": "下载任务正在执行中", "progress": progress}
+
+    if DOWNLOAD_MODE == "sync":
+        # 同步模式：等待全部下载完成后再返回响应
+        await _run_downloader()
+        return {"status": "ok", "message": "下载任务已完成（sync 模式）"}
+
+    # 后台模式：注册 BackgroundTask，接口立即返回
     background_tasks.add_task(_run_downloader)
-    return {"status": "ok", "message": "下载任务已启动"}
+    return {"status": "ok", "message": "下载任务已启动（bg 模式）"}
 
 
 @app.get("/download/status")
 async def download_status():
-    """Query 下载锁状态，可用于确认下载任务是否正在运行。"""
-    lock_since = await r.get(DOWNLOAD_LOCK_KEY)
-    return {"running": bool(lock_since), "lock_since": lock_since}
+    """查询下载锁状态及当前进度。
+
+    返回字段：
+      running  : 是否有下载任务正在执行
+      progress : 当前进度，格式 "{done}-{total}"，例如 "1-4" 表示共 4 条已完成 1 条；
+                 任务未运行时为 null
+    """
+    progress = await r.get(DOWNLOAD_LOCK_KEY)
+    return {"running": bool(progress), "progress": progress}
 
 
 #------------------------------
