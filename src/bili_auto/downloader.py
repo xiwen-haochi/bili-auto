@@ -26,7 +26,8 @@ DOWNLOAD_LOCK_TTL_SECONDS = int(os.getenv("DOWNLOAD_LOCK_TTL_SECONDS", "7200"))
 VIDEO_DONE_TTL_SECONDS = int(os.getenv("VIDEO_DONE_TTL_SECONDS", "10800"))
 MAX_DOWNLOADS_PER_RUN = int(os.getenv("MAX_DOWNLOADS_PER_RUN", "10"))
 DOWNLOAD_INTERVAL_SECONDS = int(os.getenv("DOWNLOAD_INTERVAL_SECONDS", "3"))
-CLIENT_TIMEOUT = httpx.Timeout(30.0, connect=10.0, read=60.0)
+CLIENT_TIMEOUT = httpx.Timeout(connect=10.0, read=None, write=30.0, pool=30.0)
+MAX_DOWNLOAD_RETRIES = int(os.getenv("MAX_DOWNLOAD_RETRIES", "5"))
 DOWNLOAD_DIR = Path(os.getenv("DOWNLOAD_DIR", "./downloads"))
 
 LOG_DIR = Path("logs")
@@ -108,24 +109,40 @@ def select_best_audio_stream(audios: list[dict]) -> dict:
 
 
 async def download_file(client: httpx.AsyncClient, url: str, dest: Path) -> None:
-    """异步下载单个媒体文件，并保留进度条展示。"""
-    async with client.stream("GET", url) as resp:
-        resp.raise_for_status()
-        total = int(resp.headers.get("content-length", 0))
+    """异步下载单个媒体文件，支持断点续传，失败自动重试。"""
+    for attempt in range(1, MAX_DOWNLOAD_RETRIES + 1):
+        downloaded = dest.stat().st_size if dest.exists() else 0
+        extra_headers = {"Range": f"bytes={downloaded}-"} if downloaded > 0 else {}
 
-        with (
-            dest.open("wb") as file_obj,
-            tqdm(
-                total=total,
-                unit="B",
-                unit_scale=True,
-                desc=dest.name,
-            ) as progress_bar,
-        ):
-            async for chunk in resp.aiter_bytes(chunk_size=8192):
-                if chunk:
-                    file_obj.write(chunk)
-                    progress_bar.update(len(chunk))
+        try:
+            async with client.stream("GET", url, headers=extra_headers) as resp:
+                if resp.status_code == 416:
+                    # 服务端认为已完整，直接返回
+                    return
+                resp.raise_for_status()
+                total = downloaded + int(resp.headers.get("content-length", 0))
+
+                with (
+                    dest.open("ab" if downloaded > 0 else "wb") as file_obj,
+                    tqdm(
+                        total=total,
+                        initial=downloaded,
+                        unit="B",
+                        unit_scale=True,
+                        desc=dest.name,
+                    ) as progress_bar,
+                ):
+                    async for chunk in resp.aiter_bytes(chunk_size=65536):
+                        if chunk:
+                            file_obj.write(chunk)
+                            progress_bar.update(len(chunk))
+            return  # 下载完成
+        except (httpx.RemoteProtocolError, httpx.ReadError, httpx.ConnectError) as exc:
+            if attempt == MAX_DOWNLOAD_RETRIES:
+                raise
+            wait = 2 ** attempt
+            logger.warning("下载中断（第 %d/%d 次），%d 秒后续传：%s", attempt, MAX_DOWNLOAD_RETRIES, wait, exc)
+            await asyncio.sleep(wait)
 
 
 async def merge_av(video_file: Path, audio_file: Path, output_file: Path) -> None:
