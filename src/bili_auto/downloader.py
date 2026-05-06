@@ -2,6 +2,7 @@ import asyncio
 import logging
 import os
 import re
+import sys
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, cast
@@ -80,7 +81,8 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
     handlers=[
-        logging.StreamHandler(),
+        # 显式指定 stdout，避免默认的 stderr 在部分终端/进程管理器中被屏蔽
+        logging.StreamHandler(sys.stdout),
         logging.FileHandler(LOG_DIR / "downloader.log", encoding="utf-8"),
     ],
 )
@@ -214,14 +216,50 @@ async def merge_av(video_file: Path, audio_file: Path, output_file: Path) -> Non
         raise RuntimeError("ffmpeg 合并失败，请确认本机已安装 ffmpeg")
 
 
+async def _probe_duration(path: Path) -> float:
+    """用 ffprobe 读取媒体文件的总时长（秒）。
+
+    使用 ffprobe 的 `-show_entries format=duration` 输出纯数字，无需解析 JSON，
+    比调用 ffmpeg 本身更轻量（类比 Python 中只 import 需要的模块）。
+
+    Args:
+        path: 待探测的媒体文件路径。
+
+    Returns:
+        浮点数秒数，例如 3723.45。
+
+    Raises:
+        RuntimeError: ffprobe 失败或输出无法解析时抛出。
+    """
+    process = await asyncio.create_subprocess_exec(
+        "ffprobe",
+        "-v", "quiet",
+        "-show_entries", "format=duration",
+        "-of", "default=noprint_wrappers=1:nokey=1",
+        str(path),
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.DEVNULL,
+    )
+    stdout, _ = await process.communicate()
+    if process.returncode != 0:
+        raise RuntimeError("ffprobe 探测时长失败，请确认本机已安装 ffmpeg")
+    try:
+        return float(stdout.strip())
+    except ValueError as exc:
+        raise RuntimeError(f"ffprobe 返回无法解析的时长：{stdout!r}") from exc
+
+
 async def split_mp4(source: Path, max_bytes: int) -> list[Path]:
     """将超大 mp4 按指定字节上限分割为多段，在关键帧处切割，无需重新编码。
 
     输出文件命名规则：在原文件名（不含扩展名）后追加三位 1 起始序号，例如：
       标题.mp4  →  标题_001.mp4、标题_002.mp4、标题_003.mp4
 
-    ffmpeg 使用 segment muxer 的 segment_size 选项，切割点会对齐到最近的关键帧，
-    每段实际大小可能略大于 max_bytes（通常差距在一个 GOP 范围内）。
+    实现原理：
+      `-f segment -segment_size` 仅适用于 MPEG-TS 等流式容器，MP4 写入时需要
+      seek 回头补全 moov atom，size-based 分割会导致 ffmpeg 报错。
+      因此改为 `-segment_time`（按时长分割）：先用 ffprobe 读取总时长，再按
+      文件大小比例折算每段秒数，效果与按字节限制等效。
 
     Args:
         source:    待分割的源 mp4 文件路径。
@@ -231,22 +269,29 @@ async def split_mp4(source: Path, max_bytes: int) -> list[Path]:
         分割后生成的所有段文件路径列表，按序号升序排列。
 
     Raises:
-        RuntimeError: ffmpeg 返回非零退出码时抛出。
+        RuntimeError: ffprobe 或 ffmpeg 失败时抛出。
     """
+    file_size = source.stat().st_size
+    total_duration = await _probe_duration(source)
+
+    # 按文件大小比例折算每段对应的时长（单位：秒）
+    # 例如：2.5G 文件、限制 1G → 每段约 total_duration * (1G / 2.5G) 秒
+    seconds_per_segment = (max_bytes / file_size) * total_duration
+
     stem = source.stem
     output_dir = source.parent
-    # ffmpeg segment muxer 的输出模式：标题_%03d.mp4，序号从 1 开始
+    # ffmpeg segment muxer 输出模式：标题_%03d.mp4，序号从 1 开始
     pattern = output_dir / f"{stem}_%03d.mp4"
 
     process = await asyncio.create_subprocess_exec(
         "ffmpeg",
         "-y",
         "-i", str(source),
-        "-c", "copy",                          # 不重新编码，直接复制流
-        "-f", "segment",                       # 使用 segment muxer 分段输出
-        "-segment_size", str(max_bytes),       # 每段字节上限（在关键帧对齐）
-        "-reset_timestamps", "1",              # 每段时间戳从 0 开始，便于独立播放
-        "-segment_start_number", "1",          # 序号从 001 开始而非 000
+        "-c", "copy",                                  # 不重新编码，直接复制流
+        "-f", "segment",                               # 使用 segment muxer 分段输出
+        "-segment_time", f"{seconds_per_segment:.3f}", # 每段时长（在关键帧对齐）
+        "-reset_timestamps", "1",                      # 每段时间戳从 0 开始，便于独立播放
+        "-segment_start_number", "1",                  # 序号从 001 开始而非 000
         str(pattern),
         stdout=asyncio.subprocess.DEVNULL,
         stderr=asyncio.subprocess.DEVNULL,
