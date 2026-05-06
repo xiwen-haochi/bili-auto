@@ -61,6 +61,8 @@ cp .env.example .env
 | `VIDEO_DONE_TTL_SECONDS` | `10800` | done 状态 hash 过期时间（秒） |
 | `LOGIN_MAX_POLLS` | `5` | 登录轮询最大次数 |
 | `LOGIN_POLL_INTERVAL_SECONDS` | `10` | 登录轮询间隔（秒） |
+| `MAX_MP4_SIZE` | 无 | 每个视频的大小，如1g，500m，1024 |
+| `DOWNLOAD_MODE` | `bg` | 同步或者异步下载，bg或者sync |
 
 ## 使用
 

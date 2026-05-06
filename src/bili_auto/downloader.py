@@ -29,6 +29,49 @@ DOWNLOAD_INTERVAL_SECONDS = int(os.getenv("DOWNLOAD_INTERVAL_SECONDS", "3"))
 CLIENT_TIMEOUT = httpx.Timeout(connect=10.0, read=None, write=30.0, pool=30.0)
 MAX_DOWNLOAD_RETRIES = int(os.getenv("MAX_DOWNLOAD_RETRIES", "5"))
 DOWNLOAD_DIR = Path(os.getenv("DOWNLOAD_DIR", "./downloads"))
+# DOWNLOAD_MODE：控制 async_main() 的执行方式。
+#   bg   （默认）：启动后台 asyncio task 后立即返回，适合从 API 服务触发。
+#   sync          ：原地等待全部下载完成再返回，适合 CLI 直接运行。
+DOWNLOAD_MODE = os.getenv("DOWNLOAD_MODE", "bg")
+
+
+def _parse_size(value: str) -> int:
+    """解析人类可读的文件大小字符串，返回字节数。
+
+    支持单位后缀（不区分大小写）：
+      - g / gb  → GiB（× 1024³）
+      - m / mb  → MiB（× 1024²）
+      - k / kb  → KiB（× 1024）
+      - 无后缀  → 字节
+
+    示例：
+      "1g"   → 1073741824
+      "500m" → 524288000
+      "2048" → 2048
+
+    Args:
+        value: 待解析的字符串，例如 "1g"、"500m"、"1073741824"。
+
+    Returns:
+        对应的字节数（int）。
+
+    Raises:
+        ValueError: 当字符串格式无法识别时抛出。
+    """
+    value = value.strip().lower()
+    # 依次尝试 gb/g、mb/m、kb/k 后缀，最后回落到纯数字
+    for suffix, factor in (("gb", 1024**3), ("g", 1024**3),
+                           ("mb", 1024**2), ("m", 1024**2),
+                           ("kb", 1024),   ("k", 1024)):
+        if value.endswith(suffix):
+            return int(float(value[: -len(suffix)]) * factor)
+    return int(value)
+
+
+# MAX_MP4_SIZE：合并后单个 mp4 的最大字节数；超出则自动分割为多段。
+# 未设置时不分割。示例：MAX_MP4_SIZE=1g、MAX_MP4_SIZE=500m、MAX_MP4_SIZE=1073741824
+_MAX_MP4_SIZE_STR = os.getenv("MAX_MP4_SIZE")
+MAX_MP4_SIZE: int | None = _parse_size(_MAX_MP4_SIZE_STR) if _MAX_MP4_SIZE_STR else None
 
 LOG_DIR = Path("logs")
 LOG_DIR.mkdir(exist_ok=True)
@@ -171,6 +214,52 @@ async def merge_av(video_file: Path, audio_file: Path, output_file: Path) -> Non
         raise RuntimeError("ffmpeg 合并失败，请确认本机已安装 ffmpeg")
 
 
+async def split_mp4(source: Path, max_bytes: int) -> list[Path]:
+    """将超大 mp4 按指定字节上限分割为多段，在关键帧处切割，无需重新编码。
+
+    输出文件命名规则：在原文件名（不含扩展名）后追加三位 1 起始序号，例如：
+      标题.mp4  →  标题_001.mp4、标题_002.mp4、标题_003.mp4
+
+    ffmpeg 使用 segment muxer 的 segment_size 选项，切割点会对齐到最近的关键帧，
+    每段实际大小可能略大于 max_bytes（通常差距在一个 GOP 范围内）。
+
+    Args:
+        source:    待分割的源 mp4 文件路径。
+        max_bytes: 每段的字节上限（类比 Python 的 int，即纯字节数）。
+
+    Returns:
+        分割后生成的所有段文件路径列表，按序号升序排列。
+
+    Raises:
+        RuntimeError: ffmpeg 返回非零退出码时抛出。
+    """
+    stem = source.stem
+    output_dir = source.parent
+    # ffmpeg segment muxer 的输出模式：标题_%03d.mp4，序号从 1 开始
+    pattern = output_dir / f"{stem}_%03d.mp4"
+
+    process = await asyncio.create_subprocess_exec(
+        "ffmpeg",
+        "-y",
+        "-i", str(source),
+        "-c", "copy",                          # 不重新编码，直接复制流
+        "-f", "segment",                       # 使用 segment muxer 分段输出
+        "-segment_size", str(max_bytes),       # 每段字节上限（在关键帧对齐）
+        "-reset_timestamps", "1",              # 每段时间戳从 0 开始，便于独立播放
+        "-segment_start_number", "1",          # 序号从 001 开始而非 000
+        str(pattern),
+        stdout=asyncio.subprocess.DEVNULL,
+        stderr=asyncio.subprocess.DEVNULL,
+    )
+    await process.communicate()
+    if process.returncode != 0:
+        raise RuntimeError("ffmpeg 分割失败，请确认本机已安装 ffmpeg")
+
+    # 收集所有分段文件，按序号升序返回（类似 Python sorted()）
+    parts = sorted(output_dir.glob(f"{stem}_???.mp4"))
+    return parts
+
+
 async def mark_video_status(bvid: str, mapping: dict[str, str]) -> None:
     """更新 Redis 中单个视频的下载状态。"""
     await r.hset(video_state_key(bvid), mapping=mapping)
@@ -241,12 +330,43 @@ async def download_bv(bvid: str, cookie: str) -> None:
     await merge_av(video_file, audio_file, output_file)
     video_file.unlink(missing_ok=True)
     audio_file.unlink(missing_ok=True)
-    logger.info("下载完成: %s", output_file)
+
+    # 如果设置了 MAX_MP4_SIZE 且合并后文件超出限制，则分割为多段
+    if MAX_MP4_SIZE is not None and output_file.stat().st_size > MAX_MP4_SIZE:
+        file_mb = output_file.stat().st_size / 1024 / 1024
+        limit_mb = MAX_MP4_SIZE / 1024 / 1024
+        logger.info(
+            "文件 %.1f MB 超出上限 %.1f MB，开始分割：%s",
+            file_mb, limit_mb, output_file.name,
+        )
+        parts = await split_mp4(output_file, MAX_MP4_SIZE)
+        output_file.unlink(missing_ok=True)
+        logger.info("分割完成，共 %d 段：%s", len(parts), [p.name for p in parts])
+    else:
+        logger.info("下载完成: %s", output_file)
 
 
 async def acquire_download_lock() -> bool:
-    """避免定时任务重叠执行下载队列。"""
-    return bool(await r.set(DOWNLOAD_LOCK_KEY, now_iso(), ex=DOWNLOAD_LOCK_TTL_SECONDS, nx=True))
+    """尝试获取下载锁，成功返回 True。
+
+    锁初始值为 "0-0"，待 process_ready_queue 确定批次大小后由
+    update_lock_progress 更新为 "{done}-{total}" 格式的进度字符串。
+    使用 SET NX 保证同一时刻只有一个下载任务持有锁。
+    """
+    return bool(await r.set(DOWNLOAD_LOCK_KEY, "0-0", ex=DOWNLOAD_LOCK_TTL_SECONDS, nx=True))
+
+
+async def update_lock_progress(done: int, total: int) -> None:
+    """将锁中的进度更新为 "{done}-{total}" 并刷新 TTL。
+
+    每成功或失败完成一条视频后调用，外部可通过读取锁的值观察实时进度。
+    例如：已完成 1 条、共 4 条时值为 "1-4"。
+
+    Args:
+        done:  已处理完毕（成功 + 失败）的视频数量。
+        total: 本批次计划处理的总视频数量。
+    """
+    await r.set(DOWNLOAD_LOCK_KEY, f"{done}-{total}", ex=DOWNLOAD_LOCK_TTL_SECONDS)
 
 
 async def release_download_lock() -> None:
@@ -255,7 +375,11 @@ async def release_download_lock() -> None:
 
 
 async def process_ready_queue() -> None:
-    """扫描 bili:video:* hash，找出 download=ready 的条目逐个下载，每次最多处理 MAX_DOWNLOADS_PER_RUN 个。"""
+    """扫描 bili:video:* hash，找出 download=ready 的条目逐个下载，每次最多处理 MAX_DOWNLOADS_PER_RUN 个。
+
+    每处理完一条（无论成功或失败）都会调用 update_lock_progress 刷新锁中的进度，
+    格式为 "{已完成}-{总数}"，例如 "1-4" 表示共 4 条已完成 1 条。
+    """
     cookie = await load_cookie()
     if not cookie:
         raise RuntimeError("未找到登录 Cookie，请先完成扫码登录")
@@ -274,6 +398,9 @@ async def process_ready_queue() -> None:
     batch = ready_bvs[:MAX_DOWNLOADS_PER_RUN]
     logger.info("本次共 %d 个待下载视频，最多处理 %d 个", len(ready_bvs), len(batch))
 
+    # 批次确定后立即写入总数，进度从 0 开始
+    await update_lock_progress(0, len(batch))
+
     for idx, bvid in enumerate(batch):
         await mark_video_status(
             bvid,
@@ -286,6 +413,18 @@ async def process_ready_queue() -> None:
 
         try:
             await download_bv(bvid, cookie)
+            await r.sadd(REDIS_KEY, bvid)
+            await mark_video_status(
+                bvid,
+                {
+                    "bvid": bvid,
+                    "download": "done",
+                    "error": "",
+                    "downloaded_at": now_iso(),
+                    "updated_at": now_iso(),
+                },
+            )
+            await r.expire(video_state_key(bvid), VIDEO_DONE_TTL_SECONDS)
         except Exception as exc:
             await mark_video_status(
                 bvid,
@@ -297,38 +436,45 @@ async def process_ready_queue() -> None:
                 },
             )
             logger.error("%s 下载失败：%s", bvid, exc)
-            if idx < len(batch) - 1:
-                await asyncio.sleep(DOWNLOAD_INTERVAL_SECONDS)
-            continue
 
-        await r.sadd(REDIS_KEY, bvid)
-        await mark_video_status(
-            bvid,
-            {
-                "bvid": bvid,
-                "download": "done",
-                "error": "",
-                "downloaded_at": now_iso(),
-                "updated_at": now_iso(),
-            },
-        )
-        await r.expire(video_state_key(bvid), VIDEO_DONE_TTL_SECONDS)
+        # 无论成功还是失败，完成一条后更新锁中的进度
+        await update_lock_progress(idx + 1, len(batch))
 
         if idx < len(batch) - 1:
             await asyncio.sleep(DOWNLOAD_INTERVAL_SECONDS)
 
 
 async def async_main() -> None:
-    """消费 ready 队列并更新 Redis 状态。可单独运行也可由 API 服务触发。"""
+    """消费 ready 队列并更新 Redis 状态。可单独运行也可由 API 服务触发。
+
+    执行模式由环境变量 DOWNLOAD_MODE 控制：
+      bg   （默认）：将下载包装为后台 asyncio task，本函数立即返回，
+                     适合 API handler 调用——调用方可以快速响应，下载在后台进行。
+      sync          ：原地等待全部下载完成再返回，适合 CLI 直接运行。
+
+    两种模式下锁均会记录进度，格式为 "{done}-{total}"，可通过读取
+    Redis 键 DOWNLOAD_LOCK_KEY 查询当前下载进度。
+    """
     locked = await acquire_download_lock()
     if not locked:
         logger.info("已有下载任务在执行，跳过本次运行")
         return
 
-    try:
-        await process_ready_queue()
-    finally:
-        await release_download_lock()
+    async def _task() -> None:
+        """实际下载逻辑，成功或异常后均释放锁。"""
+        try:
+            await process_ready_queue()
+        finally:
+            await release_download_lock()
+
+    if DOWNLOAD_MODE == "sync":
+        # 同步模式：等待全部下载完成后再返回
+        logger.info("下载模式：sync（同步）")
+        await _task()
+    else:
+        # 后台模式：创建 asyncio task 后立即返回，task 在事件循环中异步执行
+        logger.info("下载模式：bg（后台）")
+        asyncio.create_task(_task())
 
 
 def main() -> None:
@@ -337,6 +483,12 @@ def main() -> None:
     async def _run() -> None:
         try:
             await async_main()
+            # bg 模式下 async_main 立即返回但后台 task 仍在运行，
+            # 需等待当前协程之外的所有 task 结束后再关闭 Redis 连接，
+            # 否则事件循环退出时后台 task 会被强制取消。
+            pending = [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
+            if pending:
+                await asyncio.gather(*pending, return_exceptions=True)
         finally:
             await r.aclose()
 
