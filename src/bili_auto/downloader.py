@@ -137,7 +137,13 @@ async def download_file(client: httpx.AsyncClient, url: str, dest: Path) -> None
                             file_obj.write(chunk)
                             progress_bar.update(len(chunk))
             return  # 下载完成
-        except (httpx.RemoteProtocolError, httpx.ReadError, httpx.ConnectError) as exc:
+        except httpx.TransportError as exc:
+            # httpx.TransportError 是所有传输层错误的基类，包含：
+            #   - NetworkError (ConnectError / ReadError / WriteError)
+            #   - ProtocolError (RemoteProtocolError / LocalProtocolError)
+            #   - TimeoutException (ConnectTimeout / ReadTimeout / WriteTimeout / PoolTimeout)
+            # 大文件下载耗时较长，CDN / 中间代理可能在传输途中重置连接或触发超时，
+            # 统一用基类捕获可确保所有情况都能触发断点续传重试。
             if attempt == MAX_DOWNLOAD_RETRIES:
                 raise
             wait = 2 ** attempt
