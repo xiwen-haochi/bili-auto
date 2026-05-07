@@ -61,9 +61,14 @@ def _parse_size(value: str) -> int:
     """
     value = value.strip().lower()
     # 依次尝试 gb/g、mb/m、kb/k 后缀，最后回落到纯数字
-    for suffix, factor in (("gb", 1024**3), ("g", 1024**3),
-                           ("mb", 1024**2), ("m", 1024**2),
-                           ("kb", 1024),   ("k", 1024)):
+    for suffix, factor in (
+        ("gb", 1024**3),
+        ("g", 1024**3),
+        ("mb", 1024**2),
+        ("m", 1024**2),
+        ("kb", 1024),
+        ("k", 1024),
+    ):
         if value.endswith(suffix):
             return int(float(value[: -len(suffix)]) * factor)
     return int(value)
@@ -93,7 +98,16 @@ BASE_HEADERS = {
     "Referer": "https://www.bilibili.com",
 }
 
-r = cast(Any, redis.Redis(host=REDIS_HOST, port=REDIS_PORT, db=REDIS_DB, password=REDIS_PASSWORD, decode_responses=True))
+r = cast(
+    Any,
+    redis.Redis(
+        host=REDIS_HOST,
+        port=REDIS_PORT,
+        db=REDIS_DB,
+        password=REDIS_PASSWORD,
+        decode_responses=True,
+    ),
+)
 
 
 def now_iso() -> str:
@@ -130,9 +144,9 @@ def get_stream_url(stream: dict) -> str | None:
 
 def sanitize_title(text: str) -> str:
     """标题/作者名转安全文件名：去除首尾符号，内部符号替换为下划线，合并连续下划线。"""
-    cleaned = re.sub(r'[^\w\u4e00-\u9fff]', '_', text)
-    cleaned = cleaned.strip('_')
-    cleaned = re.sub(r'_+', '_', cleaned)
+    cleaned = re.sub(r"[^\w\u4e00-\u9fff]", "_", text)
+    cleaned = cleaned.strip("_")
+    cleaned = re.sub(r"_+", "_", cleaned)
     return cleaned or "unknown"
 
 
@@ -155,16 +169,29 @@ def select_best_audio_stream(audios: list[dict]) -> dict:
 
 async def download_file(client: httpx.AsyncClient, url: str, dest: Path) -> None:
     """异步下载单个媒体文件，支持断点续传，失败自动重试。"""
+
     for attempt in range(1, MAX_DOWNLOAD_RETRIES + 1):
         downloaded = dest.stat().st_size if dest.exists() else 0
-        extra_headers = {"Range": f"bytes={downloaded}-"} if downloaded > 0 else {}
+
+        extra_headers = {
+            "Range": f"bytes={downloaded}-",
+            "Connection": "close",  # ⭐ 强制短连接
+            "User-Agent": "Mozilla/5.0",  # ⭐ 必须
+            "Accept": "*/*",
+            "Referer": "https://www.bilibili.com",
+        }
 
         try:
             async with client.stream("GET", url, headers=extra_headers) as resp:
                 if resp.status_code == 416:
-                    # 服务端认为已完整，直接返回
                     return
+
+                if resp.status_code in (429, 503):
+                    await asyncio.sleep(5)
+                    continue
+
                 resp.raise_for_status()
+
                 total = downloaded + int(resp.headers.get("content-length", 0))
 
                 with (
@@ -177,22 +204,25 @@ async def download_file(client: httpx.AsyncClient, url: str, dest: Path) -> None
                         desc=dest.name,
                     ) as progress_bar,
                 ):
-                    async for chunk in resp.aiter_bytes(chunk_size=65536):
+                    async for chunk in resp.aiter_bytes(chunk_size=16384):  # ⭐ 更稳定
                         if chunk:
                             file_obj.write(chunk)
                             progress_bar.update(len(chunk))
-            return  # 下载完成
+
+            return
+
         except httpx.TransportError as exc:
-            # httpx.TransportError 是所有传输层错误的基类，包含：
-            #   - NetworkError (ConnectError / ReadError / WriteError)
-            #   - ProtocolError (RemoteProtocolError / LocalProtocolError)
-            #   - TimeoutException (ConnectTimeout / ReadTimeout / WriteTimeout / PoolTimeout)
-            # 大文件下载耗时较长，CDN / 中间代理可能在传输途中重置连接或触发超时，
-            # 统一用基类捕获可确保所有情况都能触发断点续传重试。
             if attempt == MAX_DOWNLOAD_RETRIES:
                 raise
-            wait = 2 ** attempt
-            logger.warning("下载中断（第 %d/%d 次），%d 秒后续传：%s", attempt, MAX_DOWNLOAD_RETRIES, wait, exc)
+
+            wait = min(2**attempt, 60)
+            logger.warning(
+                "下载中断（第 %d/%d 次），%d 秒后续传：%s",
+                attempt,
+                MAX_DOWNLOAD_RETRIES,
+                wait,
+                exc,
+            )
             await asyncio.sleep(wait)
 
 
@@ -233,9 +263,12 @@ async def _probe_duration(path: Path) -> float:
     """
     process = await asyncio.create_subprocess_exec(
         "ffprobe",
-        "-v", "quiet",
-        "-show_entries", "format=duration",
-        "-of", "default=noprint_wrappers=1:nokey=1",
+        "-v",
+        "quiet",
+        "-show_entries",
+        "format=duration",
+        "-of",
+        "default=noprint_wrappers=1:nokey=1",
         str(path),
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.DEVNULL,
@@ -286,12 +319,18 @@ async def split_mp4(source: Path, max_bytes: int) -> list[Path]:
     process = await asyncio.create_subprocess_exec(
         "ffmpeg",
         "-y",
-        "-i", str(source),
-        "-c", "copy",                                  # 不重新编码，直接复制流
-        "-f", "segment",                               # 使用 segment muxer 分段输出
-        "-segment_time", f"{seconds_per_segment:.3f}", # 每段时长（在关键帧对齐）
-        "-reset_timestamps", "1",                      # 每段时间戳从 0 开始，便于独立播放
-        "-segment_start_number", "1",                  # 序号从 001 开始而非 000
+        "-i",
+        str(source),
+        "-c",
+        "copy",  # 不重新编码，直接复制流
+        "-f",
+        "segment",  # 使用 segment muxer 分段输出
+        "-segment_time",
+        f"{seconds_per_segment:.3f}",  # 每段时长（在关键帧对齐）
+        "-reset_timestamps",
+        "1",  # 每段时间戳从 0 开始，便于独立播放
+        "-segment_start_number",
+        "1",  # 序号从 001 开始而非 000
         str(pattern),
         stdout=asyncio.subprocess.DEVNULL,
         stderr=asyncio.subprocess.DEVNULL,
@@ -382,7 +421,9 @@ async def download_bv(bvid: str, cookie: str) -> None:
         limit_mb = MAX_MP4_SIZE / 1024 / 1024
         logger.info(
             "文件 %.1f MB 超出上限 %.1f MB，开始分割：%s",
-            file_mb, limit_mb, output_file.name,
+            file_mb,
+            limit_mb,
+            output_file.name,
         )
         parts = await split_mp4(output_file, MAX_MP4_SIZE)
         output_file.unlink(missing_ok=True)
@@ -398,7 +439,9 @@ async def acquire_download_lock() -> bool:
     update_lock_progress 更新为 "{done}-{total}" 格式的进度字符串。
     使用 SET NX 保证同一时刻只有一个下载任务持有锁。
     """
-    return bool(await r.set(DOWNLOAD_LOCK_KEY, "0-0", ex=DOWNLOAD_LOCK_TTL_SECONDS, nx=True))
+    return bool(
+        await r.set(DOWNLOAD_LOCK_KEY, "0-0", ex=DOWNLOAD_LOCK_TTL_SECONDS, nx=True)
+    )
 
 
 async def update_lock_progress(done: int, total: int) -> None:
@@ -433,7 +476,7 @@ async def process_ready_queue() -> None:
     async for key in r.scan_iter(f"{VIDEO_REDIS_PREFIX}*"):
         status = await r.hget(key, "download")
         if status == "ready":
-            ready_bvs.append(key[len(VIDEO_REDIS_PREFIX):])
+            ready_bvs.append(key[len(VIDEO_REDIS_PREFIX) :])
     ready_bvs.sort()
 
     if not ready_bvs:
@@ -531,7 +574,9 @@ def main() -> None:
             # bg 模式下 async_main 立即返回但后台 task 仍在运行，
             # 需等待当前协程之外的所有 task 结束后再关闭 Redis 连接，
             # 否则事件循环退出时后台 task 会被强制取消。
-            pending = [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
+            pending = [
+                t for t in asyncio.all_tasks() if t is not asyncio.current_task()
+            ]
             if pending:
                 await asyncio.gather(*pending, return_exceptions=True)
         finally:
