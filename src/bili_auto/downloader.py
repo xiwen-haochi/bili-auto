@@ -4,6 +4,7 @@ import os
 import re
 import sys
 from datetime import datetime, timezone
+from logging.handlers import TimedRotatingFileHandler
 from pathlib import Path
 from typing import Any, cast
 
@@ -82,13 +83,34 @@ MAX_MP4_SIZE: int | None = _parse_size(_MAX_MP4_SIZE_STR) if _MAX_MP4_SIZE_STR e
 LOG_DIR = Path("logs")
 LOG_DIR.mkdir(exist_ok=True)
 
+_file_handler = TimedRotatingFileHandler(
+    filename=str(LOG_DIR / "downloader.log"),
+    when="midnight",
+    interval=1,
+    backupCount=30,
+    encoding="utf-8",
+    utc=False,
+)
+"""按天轮转的文件日志 handler（使用 TimedRotatingFileHandler 默认命名方式）。
+
+默认命名规则（举例）：
+  - 当前写入文件：logs/downloader.log
+  - 午夜轮转后文件：logs/downloader.log.2026-05-08
+
+参数说明（尽量对齐 Python 标准库语义）：
+  - when="midnight"：每天 00:00 触发轮转（本地时区）
+  - interval=1：每 1 天轮转一次
+  - backupCount=30：最多保留 30 个历史文件（超过会自动删除更旧的）
+  - utc=False：按本地时间切日；如果部署环境希望按 UTC 切日可改 True
+"""
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
     handlers=[
         # 显式指定 stdout，避免默认的 stderr 在部分终端/进程管理器中被屏蔽
         logging.StreamHandler(sys.stdout),
-        logging.FileHandler(LOG_DIR / "downloader.log", encoding="utf-8"),
+        _file_handler,
     ],
 )
 logger = logging.getLogger(__name__)
