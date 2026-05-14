@@ -65,7 +65,16 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-r = cast(Any, redis.Redis(host=REDIS_HOST, port=REDIS_PORT, db=REDIS_DB, password=REDIS_PASSWORD, decode_responses=True))
+r = cast(
+    Any,
+    redis.Redis(
+        host=REDIS_HOST,
+        port=REDIS_PORT,
+        db=REDIS_DB,
+        password=REDIS_PASSWORD,
+        decode_responses=True,
+    ),
+)
 
 
 @asynccontextmanager
@@ -147,7 +156,9 @@ async def load_cookie() -> str | None:
 async def acquire_scan_lock() -> str | None:
     """尝试获取扫描锁，成功时返回本次锁令牌，失败时返回 None。"""
     lock_token = token_hex(16)
-    locked = await r.set(SCAN_FAV_LOCK_KEY, lock_token, ex=SCAN_FAV_LOCK_TTL_SECONDS, nx=True)
+    locked = await r.set(
+        SCAN_FAV_LOCK_KEY, lock_token, ex=SCAN_FAV_LOCK_TTL_SECONDS, nx=True
+    )
     return lock_token if locked else None
 
 
@@ -336,7 +347,9 @@ async def poll_login_status_task(qrcode_key: str) -> None:
             timeout=CLIENT_TIMEOUT,
         ) as client:
             try:
-                data = await fetch_json(client, poll_url, params={"qrcode_key": qrcode_key})
+                data = await fetch_json(
+                    client, poll_url, params={"qrcode_key": qrcode_key}
+                )
             except Exception as exc:
                 await save_login_state(
                     qrcode_key,
@@ -452,7 +465,9 @@ async def login_qrcode(background_tasks: BackgroundTasks):
         resp = await fetch_json(client, api)
 
     if resp.get("code") != 0:
-        raise HTTPException(status_code=502, detail={"error": "获取二维码失败", "raw": resp})
+        raise HTTPException(
+            status_code=502, detail={"error": "获取二维码失败", "raw": resp}
+        )
 
     qrcode_url = resp["data"]["url"]
     qrcode_key = resp["data"]["qrcode_key"]
@@ -498,6 +513,7 @@ async def login_poll(qrcode_key: str):
 # 扫描收藏夹
 # -----------------------------
 
+
 async def get_wbi_key(client):
     resp = await client.get("https://api.bilibili.com/x/web-interface/nav")
     data = resp.json()
@@ -508,6 +524,7 @@ async def get_wbi_key(client):
     sub_key = sub_url.split("/")[-1].split(".")[0]
 
     return img_key + sub_key
+
 
 def wbi_sign(params: dict, wbi_key: str):
     # 1. 添加 wts
@@ -524,7 +541,6 @@ def wbi_sign(params: dict, wbi_key: str):
     return params
 
 
-
 async def scan_fav(cookie: str, folder_name: str | None = None) -> list[str]:
     headers = {"Cookie": cookie, **BASE_HEADERS}
 
@@ -533,7 +549,9 @@ async def scan_fav(cookie: str, folder_name: str | None = None) -> list[str]:
         wbi_key = await get_wbi_key(client)
 
         # 获取 UID
-        nav_resp = await fetch_json(client, "https://api.bilibili.com/x/web-interface/nav")
+        nav_resp = await fetch_json(
+            client, "https://api.bilibili.com/x/web-interface/nav"
+        )
         uid = nav_resp["data"]["mid"]
 
         # 获取收藏夹列表
@@ -678,9 +696,9 @@ async def download_status():
     return {"running": bool(progress), "progress": progress}
 
 
-#------------------------------
+# ------------------------------
 # 获取指定up的视频动态列表
-#------------------------------
+# ------------------------------
 
 
 async def fetch_all_up_video_dynamic(uid: int, cookie: str):
@@ -692,6 +710,7 @@ async def fetch_all_up_video_dynamic(uid: int, cookie: str):
         "Cookie": cookie,
         "User-Agent": "Mozilla/5.0",
         "Referer": f"https://space.bilibili.com/{uid}/dynamic",
+        "Origin": "https://www.bilibili.com",
     }
 
     offset = ""
@@ -710,7 +729,7 @@ async def fetch_all_up_video_dynamic(uid: int, cookie: str):
 
             resp = await client.get(
                 "https://api.bilibili.com/x/polymer/web-dynamic/v1/feed/space",
-                params=params
+                params=params,
             )
             data = resp.json()
 
@@ -727,22 +746,22 @@ async def fetch_all_up_video_dynamic(uid: int, cookie: str):
 
                 archive = item["modules"]["module_dynamic"]["major"]["archive"]
 
-                results.append({
-                    "type": "video",
-                    "dynamic_id": item["id_str"],
-                    "title": archive["title"],
-                    "bv": archive["bvid"],
-                    "cover": archive["cover"],
-                    "desc": archive.get("desc", ""),
-                    "pubtime": item["modules"]["module_author"]["pub_ts"],
-                })
-
+                results.append(
+                    {
+                        "type": "video",
+                        "dynamic_id": item["id_str"],
+                        "title": archive["title"],
+                        "bv": archive["bvid"],
+                        "cover": archive["cover"],
+                        "desc": archive.get("desc", ""),
+                        "pubtime": item["modules"]["module_author"]["pub_ts"],
+                    }
+                )
             offset = data["data"]["offset"]
             if not offset:
                 break
 
     return results
-
 
 
 @app.get("/up_video_dynamic_all")
@@ -769,9 +788,11 @@ async def up_video_dynamic_all(uid: int):
 
     return {"status": "ok", "uid": uid, "queued": queued, "total_fetched": len(data)}
 
+
 # -----------------------------
 # 获取指定用户的最新动态
 # -----------------------------
+
 
 async def fetch_latest_up_video_dynamic(uid: int, cookie: str):
     """
@@ -793,7 +814,7 @@ async def fetch_latest_up_video_dynamic(uid: int, cookie: str):
 
         resp = await client.get(
             "https://api.bilibili.com/x/polymer/web-dynamic/v1/feed/space",
-            params=params
+            params=params,
         )
         data = resp.json()
 
@@ -818,6 +839,7 @@ async def fetch_latest_up_video_dynamic(uid: int, cookie: str):
         }
 
     return None
+
 
 @app.get("/check_up_new_video")
 async def check_up_new_video(uids: list[int] = Query(...)):
@@ -846,7 +868,12 @@ async def check_up_new_video(uids: list[int] = Query(...)):
         if stored_id is None:
             await r.set(redis_key, dynamic_id)
             # await enqueue_ready_video(bv)
-            summary[str(uid)] = {"new": True, "action": "first_seen", "bv": bv, "dynamic_id": dynamic_id}
+            summary[str(uid)] = {
+                "new": True,
+                "action": "first_seen",
+                "bv": bv,
+                "dynamic_id": dynamic_id,
+            }
         elif stored_id == dynamic_id:
             summary[str(uid)] = {"new": False, "action": "no_change"}
         else:
@@ -862,9 +889,11 @@ async def check_up_new_video(uids: list[int] = Query(...)):
 
     return {"status": "ok", "result": summary}
 
+
 # -----------------------------
 # 获取关注的所有up
 # -----------------------------
+
 
 async def fetch_followings(cookie: str):
     """
@@ -905,15 +934,18 @@ async def fetch_followings(cookie: str):
                 break
 
             for item in list_data:
-                results.append({
-                    "uid": item["mid"],
-                    "name": item["uname"],
-                })
+                results.append(
+                    {
+                        "uid": item["mid"],
+                        "name": item["uname"],
+                    }
+                )
 
             page += 1
 
         return results
-    
+
+
 @app.get("/my_followings")
 async def my_followings():
     cookie = await load_cookie()
@@ -922,7 +954,6 @@ async def my_followings():
 
     data = await fetch_followings(cookie)
     return data
-
 
 
 # -----------------------------
@@ -955,8 +986,6 @@ async def keep_alive():
         return {"status": "ok", "uname": data["data"]["uname"]}
     else:
         return {"status": "failed", "data": data}
-    
-
 
 
 # -----------------------------
@@ -977,13 +1006,16 @@ async def health():
     # ffmpeg 可用性
     try:
         proc = await asyncio.create_subprocess_exec(
-            "ffmpeg", "-version",
+            "ffmpeg",
+            "-version",
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
         stdout, _ = await proc.communicate()
         first_line = stdout.decode(errors="replace").splitlines()[0] if stdout else ""
-        result["ffmpeg"] = first_line if proc.returncode == 0 else "error: ffmpeg exited non-zero"
+        result["ffmpeg"] = (
+            first_line if proc.returncode == 0 else "error: ffmpeg exited non-zero"
+        )
     except FileNotFoundError:
         result["ffmpeg"] = "error: ffmpeg not found in PATH"
     except Exception as exc:
@@ -995,13 +1027,19 @@ async def health():
 
     # B 站接口连通性（不需要登录）
     try:
-        async with httpx.AsyncClient(headers=BASE_HEADERS, timeout=httpx.Timeout(10.0)) as client:
+        async with httpx.AsyncClient(
+            headers=BASE_HEADERS, timeout=httpx.Timeout(10.0)
+        ) as client:
             resp = await client.get("https://api.bilibili.com/x/web-interface/nav")
-        result["bilibili_api"] = "ok" if resp.status_code == 200 else f"http {resp.status_code}"
+        result["bilibili_api"] = (
+            "ok" if resp.status_code == 200 else f"http {resp.status_code}"
+        )
     except Exception as exc:
         result["bilibili_api"] = f"error: {exc}"
 
-    overall = "ok" if all(v == "ok" or v is True for v in result.values()) else "degraded"
+    overall = (
+        "ok" if all(v == "ok" or v is True for v in result.values()) else "degraded"
+    )
     return {"status": overall, **result}
 
 
