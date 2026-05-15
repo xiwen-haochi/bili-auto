@@ -396,6 +396,11 @@ async def download_bv(bvid: str, cookie: str) -> None:
         author = view["owner"]["name"]
         cid = view["pages"][0]["cid"]
 
+        # 从 Redis 获取 folder_name（如果存在）
+        folder_name = await r.hget(video_state_key(bvid), "folder_name")
+        if folder_name:
+            folder_name = f"fav-{sanitize_title(folder_name)}"
+
         # 先请求高档清晰度，再从服务端返回的候选流中选最高一档。
         play_resp = await fetch_json(
             client,
@@ -423,7 +428,15 @@ async def download_bv(bvid: str, cookie: str) -> None:
 
         safe_author = sanitize_title(author)
         clean_title = sanitize_title(title)
-        video_dir = DOWNLOAD_DIR / safe_author
+
+        # 根据 folder_name 决定文件保存路径
+        if folder_name:
+            # 有 folder_name 时：folder_name/作者-标题名.mp4
+            video_dir = DOWNLOAD_DIR / folder_name
+        else:
+            # 无 folder_name 时：作者名/标题名.mp4
+            video_dir = DOWNLOAD_DIR / safe_author
+
         video_dir.mkdir(parents=True, exist_ok=True)
 
         video_file = video_dir / f"{bvid}_video.m4s"

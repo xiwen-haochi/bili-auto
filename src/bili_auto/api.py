@@ -607,7 +607,7 @@ async def scan_fav(cookie: str, folder_name: str | None = None) -> list[str]:
     return new_bvs
 
 
-async def enqueue_ready_video(bvid: str) -> None:
+async def enqueue_ready_video(bvid: str, folder_name: str | None = None) -> None:
     """把待下载视频写入 Redis hash，并初始化下载状态字段。"""
     now = now_iso()
     await r.hset(
@@ -617,6 +617,7 @@ async def enqueue_ready_video(bvid: str) -> None:
             "download": "ready",
             "created_at": now,
             "updated_at": now,
+            "folder_name": folder_name or None,
         },
     )
 
@@ -627,6 +628,8 @@ async def scan_fav_api(folder_name: str | None = None):
     cookie = await load_cookie()
     if not cookie:
         return {"error": "not logged in"}
+    if not folder_name:  # 新增必须指定收藏夹了
+        return {"error": "folder_name is required"}
 
     lock_token = await acquire_scan_lock()
     if not lock_token:
@@ -647,7 +650,7 @@ async def scan_fav_api(folder_name: str | None = None):
 
         queued = []
         for bv in new_bvs:
-            await enqueue_ready_video(bv)
+            await enqueue_ready_video(bv, folder_name)
             queued.append(bv)
 
         return {"status": "ok", "queued": queued, "ready_count": len(queued)}
