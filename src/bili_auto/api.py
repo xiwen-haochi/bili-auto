@@ -541,7 +541,7 @@ def wbi_sign(params: dict, wbi_key: str):
     return params
 
 
-async def scan_fav(cookie: str, folder_name: str | None = None) -> list[str]:
+async def scan_fav(cookie: str, folder_name: str | None = None) -> list[dict]:
     headers = {"Cookie": cookie, **BASE_HEADERS}
 
     async with httpx.AsyncClient(headers=headers, timeout=CLIENT_TIMEOUT) as client:
@@ -593,6 +593,7 @@ async def scan_fav(cookie: str, folder_name: str | None = None) -> list[str]:
 
                 for m in medias:
                     bv = m["bv_id"]
+                    rid = m["id"]
                     if bv and bv not in seen:
                         seen.add(bv)
                         if await r.sismember(REDIS_KEY, bv):
@@ -600,14 +601,45 @@ async def scan_fav(cookie: str, folder_name: str | None = None) -> list[str]:
                         download_status = await r.hget(video_state_key(bv), "download")
                         if download_status in ("ready", "downloading"):
                             continue
-                        new_bvs.append(bv)
+                        new_bvs.append({"bv": bv, "rid": rid, "media_id": media_id})
 
                 pn += 1
 
     return new_bvs
 
 
-async def enqueue_ready_video(bvid: str, folder_name: str | None = None) -> None:
+async def delete_fav_item(
+    client: httpx.AsyncClient, media_id: int, rid: int, bili_jct: str
+):
+    """
+    使用 /x/v3/fav/resource/deal 从指定收藏夹删除单个视频
+    rid = 视频 ID（对应收藏里的那条资源）
+    media_id = 收藏夹 ID
+    """
+    url = "https://api.bilibili.com/x/v3/fav/resource/deal"
+
+    data = {
+        "rid": str(rid),  # ⭐ 视频 ID
+        "type": "2",  # 视频
+        "del_media_ids": str(media_id),  # ⭐ 要从哪个收藏夹删
+        "csrf": bili_jct,
+        "platform": "web",
+    }
+
+    resp = await client.post(url, data=data)
+    data = resp.json()
+
+    if data.get("code") != 0:
+        logger.error("删除收藏失败: %s", data)
+        return False
+
+    return True
+
+
+async def enqueue_ready_video(
+    bvid: str,
+    folder_name: str | None = None,
+) -> None:
     """把待下载视频写入 Redis hash，并初始化下载状态字段。"""
     now = now_iso()
     await r.hset(
@@ -640,7 +672,7 @@ async def scan_fav_api(folder_name: str | None = None):
 
     try:
         try:
-            new_bvs = await scan_fav(cookie, folder_name)
+            new_items = await scan_fav(cookie, folder_name)
         except httpx.HTTPStatusError as exc:
             return {
                 "status": "failed",
@@ -649,13 +681,186 @@ async def scan_fav_api(folder_name: str | None = None):
             }
 
         queued = []
-        for bv in new_bvs:
-            await enqueue_ready_video(bv, folder_name)
-            queued.append(bv)
+        bili_jct = extract_bili_jct(cookie)
+        async with httpx.AsyncClient(
+            headers={"Cookie": cookie, **BASE_HEADERS}, timeout=30
+        ) as client:
+            # wbi_key = await get_wbi_key(client)
+
+            for item in new_items:
+                bv = item["bv"]
+                rid = item["rid"]
+                media_id = item["media_id"]
+                # 加入队列
+                await enqueue_ready_video(bv, folder_name)
+                queued.append(bv)
+
+                # 删除收藏夹内容
+                ok = await delete_fav_item(client, media_id, rid, bili_jct)
+                if ok:
+                    logger.info("已从收藏夹删除 BV=%s (rid=%s)", bv, rid)
+                else:
+                    logger.warning("删除失败 BV=%s (rid=%s)", bv, rid)
 
         return {"status": "ok", "queued": queued, "ready_count": len(queued)}
     finally:
         await release_scan_lock(lock_token)
+
+
+def extract_bili_jct(cookie: str) -> str | None:
+    for part in cookie.split(";"):
+        part = part.strip()
+        if part.startswith("bili_jct="):
+            return part.split("=", 1)[1]
+    return None
+
+
+async def fetch_fav_all_items(cookie: str, folder_name: str):
+    """
+    获取指定收藏夹的全部内容，返回 [{bv, rid, title}]
+    """
+    headers = {"Cookie": cookie, **BASE_HEADERS}
+
+    async with httpx.AsyncClient(headers=headers, timeout=CLIENT_TIMEOUT) as client:
+        # 获取 WBI key
+        wbi_key = await get_wbi_key(client)
+
+        # 获取 UID
+        nav_resp = await fetch_json(
+            client, "https://api.bilibili.com/x/web-interface/nav"
+        )
+        uid = nav_resp["data"]["mid"]
+
+        # 获取收藏夹列表
+        fav_resp = await fetch_json(
+            client,
+            f"https://api.bilibili.com/x/v3/fav/folder/created/list-all?up_mid={uid}",
+        )
+        favs = fav_resp["data"]["list"]
+
+        # 找到指定收藏夹
+        target = None
+        for f in favs:
+            if f["title"] == folder_name:
+                target = f
+                break
+
+        if not target:
+            return {"error": f"未找到名称为《{folder_name}》的收藏夹"}
+
+        media_id = target["id"]
+
+        # 开始分页读取收藏夹内容
+        results = []
+        pn = 1
+
+        while True:
+            params = {"media_id": media_id, "pn": pn, "ps": 20}
+            params = wbi_sign(params, wbi_key)
+
+            resp = await fetch_json(
+                client,
+                "https://api.bilibili.com/x/v3/fav/resource/list",
+                params=params,
+            )
+
+            medias = resp["data"]["medias"]
+            if not medias:
+                break
+
+            for m in medias:
+                bv = m.get("bv_id")
+                rid = m.get("id")
+                title = m.get("title")
+
+                if bv:
+                    results.append(
+                        {
+                            "bv": bv,
+                            "rid": rid,
+                            "title": title,
+                        }
+                    )
+
+            pn += 1
+
+        return results
+
+
+@app.get("/fav_items")
+async def fav_items(folder_name: str):
+    """获取指定收藏夹的全部内容，返回 [{bv, rid, title}]"""
+    cookie = await load_cookie()
+    if not cookie:
+        return {"error": "not logged in"}
+
+    data = await fetch_fav_all_items(cookie, folder_name)
+    return data
+
+
+async def get_media_id_by_name(
+    client: httpx.AsyncClient, uid: int, folder_name: str
+) -> int | None:
+    """根据收藏夹名称获取 media_id"""
+    resp = await fetch_json(
+        client,
+        f"https://api.bilibili.com/x/v3/fav/folder/created/list-all?up_mid={uid}",
+    )
+    favs = resp["data"]["list"]
+
+    for f in favs:
+        if f["title"] == folder_name:
+            return f["id"]
+
+    return None
+
+
+@app.get("/fav_delete")
+async def fav_delete(folder_name: str, rid: int):
+    """
+    删除指定收藏夹中的指定视频（传入 rid）
+    """
+    cookie = await load_cookie()
+    if not cookie:
+        return {"error": "not logged in"}
+
+    # 提取 bili_jct（删除操作必须）
+    bili_jct = extract_bili_jct(cookie)
+    if not bili_jct:
+        return {"error": "cookie missing bili_jct"}
+
+    async with httpx.AsyncClient(
+        headers={"Cookie": cookie, **BASE_HEADERS}, timeout=30
+    ) as client:
+        # 获取 UID
+        nav = await fetch_json(client, "https://api.bilibili.com/x/web-interface/nav")
+        uid = nav["data"]["mid"]
+
+        # 获取收藏夹 media_id
+        media_id = await get_media_id_by_name(client, uid, folder_name)
+        if not media_id:
+            return {"error": f"未找到名称为《{folder_name}》的收藏夹"}
+
+        # 获取 WBI key
+        # wbi_key = await get_wbi_key(client)
+
+        # 调用删除接口
+        ok = await delete_fav_item(client, media_id, rid, bili_jct)
+
+        if ok:
+            return {
+                "status": "ok",
+                "folder_name": folder_name,
+                "rid": rid,
+                "message": "删除成功",
+            }
+        else:
+            return {
+                "status": "failed",
+                "folder_name": folder_name,
+                "rid": rid,
+                "message": "删除失败",
+            }
 
 
 # -----------------------------
