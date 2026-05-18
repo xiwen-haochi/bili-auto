@@ -1,60 +1,66 @@
+"""
+FastAPI 应用入口与路由定义模块。
+
+负责：
+  - FastAPI 实例创建、生命周期管理、API 鉴权
+  - 所有 HTTP 路由（登录、扫描、下载触发等）
+
+业务逻辑委托给 bilibili_api / downloader / redis_client 等模块，
+本模块仅做路由编排。
+"""
+
 import asyncio
-import base64
-import hashlib
-import json
 import logging
-import os
-import re
-import time
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
-from io import BytesIO
-from pathlib import Path
-from secrets import token_hex
-from typing import Any, cast
 
 import httpx
-import qrcode
-import redis.asyncio as redis
-from dotenv import load_dotenv
-from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Query, Security
+from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Query
 from fastapi.responses import HTMLResponse
 from fastapi.security.api_key import APIKeyHeader
-from qrcode import constants as qrcode_constants
 
-from bili_auto.downloader import (
+from bili_auto.bilibili_api import (
+    delete_fav_item,
+    fetch_all_up_video_dynamic,
+    fetch_fav_all_items,
+    fetch_followings,
+    fetch_latest_up_video_dynamic,
+    get_media_id_by_name,
+    poll_login_status_task,
+    scan_fav,
+)
+from bili_auto.config import (
+    API_CLIENT_TIMEOUT,
+    API_KEY,
+    AUTH_HEADERS,
+    BASE_HEADERS,
     DOWNLOAD_LOCK_KEY,
     DOWNLOAD_MODE,
-    async_main as _run_downloader,
-    r as downloader_r,
+    LOG_DIR,
+    UP_DYNAMIC_PREFIX,
+)
+from bili_auto.downloader import async_main as _run_downloader
+from bili_auto.redis_client import (
+    acquire_scan_lock,
+    enqueue_ready_video,
+    get_video_download_status,
+    is_video_downloaded,
+    load_cookie,
+    load_login_state,
+    r,
+    release_scan_lock,
+    save_login_state,
+)
+from bili_auto.templates import build_login_page
+from bili_auto.utils import (
+    build_qrcode_data_url,
+    extract_bili_jct,
+    fetch_json,
+    now_iso,
 )
 
-load_dotenv()
-
 # -----------------------------
-# 配置
+# 日志配置（API 服务专用）
 # -----------------------------
-REDIS_HOST = os.getenv("REDIS_HOST", "localhost")
-REDIS_PORT = int(os.getenv("REDIS_PORT", "6379"))
-REDIS_DB = int(os.getenv("REDIS_DB", "0"))
-REDIS_PASSWORD = os.getenv("REDIS_PASSWORD") or None
-API_KEY = os.getenv("API_KEY", "")
-
-REDIS_KEY = os.getenv("REDIS_KEY", "bili:downloaded")
-COOKIE_REDIS_KEY = os.getenv("COOKIE_REDIS_KEY", "bili:auth:cookie")
-LOGIN_REDIS_PREFIX = os.getenv("LOGIN_REDIS_PREFIX", "bili:login:")
-VIDEO_REDIS_PREFIX = os.getenv("VIDEO_REDIS_PREFIX", "bili:video:")
-SCAN_FAV_LOCK_KEY = os.getenv("SCAN_FAV_LOCK_KEY", "bili:scan_fav:lock")
-SCAN_FAV_LOCK_TTL_SECONDS = int(os.getenv("SCAN_FAV_LOCK_TTL_SECONDS", "1800"))
-LOGIN_POLL_INTERVAL_SECONDS = int(os.getenv("LOGIN_POLL_INTERVAL_SECONDS", "10"))
-LOGIN_MAX_POLLS = int(os.getenv("LOGIN_MAX_POLLS", "5"))
-LOGIN_KEY_TTL_SECONDS = int(os.getenv("LOGIN_KEY_TTL_SECONDS", "600"))
-UP_DYNAMIC_PREFIX = os.getenv("UP_DYNAMIC_PREFIX", "bili:up:dynamic:")
-CLIENT_TIMEOUT = httpx.Timeout(30.0, connect=10.0, read=60.0)
-
-LOG_DIR = Path("logs")
-LOG_DIR.mkdir(exist_ok=True)
-
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -65,18 +71,10 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-r = cast(
-    Any,
-    redis.Redis(
-        host=REDIS_HOST,
-        port=REDIS_PORT,
-        db=REDIS_DB,
-        password=REDIS_PASSWORD,
-        decode_responses=True,
-    ),
-)
 
-
+# -----------------------------
+# FastAPI 生命周期
+# -----------------------------
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     """使用 FastAPI 新版生命周期接口，在应用退出时关闭 Redis 连接。"""
@@ -84,7 +82,6 @@ async def lifespan(_: FastAPI):
         yield
     finally:
         await r.aclose()
-        await downloader_r.aclose()
 
 
 # -----------------------------
@@ -93,7 +90,7 @@ async def lifespan(_: FastAPI):
 _api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
 
 
-async def verify_api_key(key: str | None = Security(_api_key_header)) -> None:
+async def verify_api_key(key: str | None = Depends(_api_key_header)) -> None:
     """全局依赖：API_KEY 已配置时，校验请求头中的 X-API-Key。"""
     if API_KEY and key != API_KEY:
         raise HTTPException(status_code=401, detail="Invalid or missing API key")
@@ -101,350 +98,9 @@ async def verify_api_key(key: str | None = Security(_api_key_header)) -> None:
 
 app = FastAPI(lifespan=lifespan, dependencies=[Depends(verify_api_key)])
 
-BASE_HEADERS = {
-    "User-Agent": "Mozilla/5.0",
-    "Referer": "https://www.bilibili.com",
-}
-
-AUTH_HEADERS = {
-    **BASE_HEADERS,
-    "Origin": "https://www.bilibili.com",
-}
-
 
 # -----------------------------
-# 工具函数
-# -----------------------------
-def now_iso() -> str:
-    """统一输出 UTC 时间字符串，便于 Redis 中的状态调试。"""
-    return datetime.now(timezone.utc).isoformat()
-
-
-def login_state_key(qrcode_key: str) -> str:
-    """拼出二维码登录状态在 Redis 中对应的 key。"""
-    return f"{LOGIN_REDIS_PREFIX}{qrcode_key}"
-
-
-def video_state_key(bvid: str) -> str:
-    """拼出单个视频在 Redis 中的元数据 key。"""
-    return f"{VIDEO_REDIS_PREFIX}{bvid}"
-
-
-async def save_login_state(qrcode_key: str, mapping: dict[str, str]) -> None:
-    """将二维码状态写入 Redis，并刷新过期时间。"""
-    key = login_state_key(qrcode_key)
-    await r.hset(key, mapping=mapping)
-    await r.expire(key, LOGIN_KEY_TTL_SECONDS)
-
-
-async def load_login_state(qrcode_key: str) -> dict[str, str] | None:
-    """读取 Redis 中的二维码状态，不存在时返回 None。"""
-    data = await r.hgetall(login_state_key(qrcode_key))
-    return data or None
-
-
-async def save_cookie(cookie: str) -> None:
-    """将当前登录态仅保存到 Redis，不再落地本地文件。"""
-    await r.set(COOKIE_REDIS_KEY, cookie)
-
-
-async def load_cookie() -> str | None:
-    """从 Redis 读取当前登录 Cookie。"""
-    return await r.get(COOKIE_REDIS_KEY)
-
-
-async def acquire_scan_lock() -> str | None:
-    """尝试获取扫描锁，成功时返回本次锁令牌，失败时返回 None。"""
-    lock_token = token_hex(16)
-    locked = await r.set(
-        SCAN_FAV_LOCK_KEY, lock_token, ex=SCAN_FAV_LOCK_TTL_SECONDS, nx=True
-    )
-    return lock_token if locked else None
-
-
-async def release_scan_lock(lock_token: str) -> None:
-    """只在当前请求仍持有锁时释放，避免误删其他请求的新锁。"""
-    current_token = await r.get(SCAN_FAV_LOCK_KEY)
-    if current_token == lock_token:
-        await r.delete(SCAN_FAV_LOCK_KEY)
-
-
-def cookies_to_string(cookies: httpx.Cookies) -> str:
-    """把 httpx 的 cookie 容器序列化成标准请求头格式。
-
-    httpx 在存在同名 cookie 且 domain/path 不同时，直接按名称读取会抛 CookieConflict，
-    这里改为遍历底层 cookie jar，并按名称保留最后一个值用于请求头。
-    """
-    cookie_map: dict[str, str] = {}
-    for cookie in cookies.jar:
-        if cookie.value is not None:
-            cookie_map[cookie.name] = cookie.value
-    return "; ".join(f"{key}={value}" for key, value in cookie_map.items())
-
-
-def get_stream_url(stream: dict) -> str | None:
-    """兼容 B 站字段大小写差异，提取流地址。"""
-    return stream.get("baseUrl") or stream.get("base_url")
-
-
-def build_qrcode_data_url(qrcode_url: str) -> str:
-    """在服务端直接生成二维码图片，浏览器可以原样展示。"""
-    qr = qrcode.QRCode(error_correction=qrcode_constants.ERROR_CORRECT_L)
-    qr.add_data(qrcode_url)
-    qr.make(fit=True)
-    img = qr.make_image(fill_color="black", back_color="white")
-
-    buffer = BytesIO()
-    cast(Any, img).save(buffer, "PNG")
-    img_base64 = base64.b64encode(buffer.getvalue()).decode()
-    return "data:image/png;base64," + img_base64
-
-
-def build_login_page(qrcode_key: str, qrcode_data_url: str) -> str:
-    """返回一个可直接扫码的页面，前端无需再自己拼图片。"""
-    qrcode_key_json = json.dumps(qrcode_key)
-    return f"""<!DOCTYPE html>
-<html lang=\"zh-CN\">
-<head>
-  <meta charset=\"UTF-8\" />
-  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\" />
-  <title>B 站扫码登录</title>
-  <style>
-    body {{
-      margin: 0;
-      min-height: 100vh;
-      display: grid;
-      place-items: center;
-      background: linear-gradient(135deg, #f7efe6 0%, #d8ecff 100%);
-      font-family: "PingFang SC", "Hiragino Sans GB", sans-serif;
-      color: #1f2937;
-    }}
-    .panel {{
-      width: min(92vw, 420px);
-      padding: 28px;
-      border-radius: 24px;
-      background: rgba(255, 255, 255, 0.92);
-      box-shadow: 0 20px 50px rgba(15, 23, 42, 0.15);
-      text-align: center;
-      backdrop-filter: blur(12px);
-    }}
-    img {{
-      width: min(72vw, 280px);
-      height: min(72vw, 280px);
-      border-radius: 16px;
-      background: #fff;
-      padding: 12px;
-      box-sizing: border-box;
-    }}
-    h1 {{
-      margin: 0 0 12px;
-      font-size: 26px;
-    }}
-    p {{
-      margin: 8px 0;
-      line-height: 1.6;
-    }}
-    .meta {{
-      color: #4b5563;
-      font-size: 14px;
-      word-break: break-all;
-    }}
-    .status {{
-      margin-top: 18px;
-      padding: 14px;
-      border-radius: 14px;
-      background: #f8fafc;
-    }}
-  </style>
-</head>
-<body>
-  <main class=\"panel\">
-    <h1>B 站扫码登录</h1>
-    <p>请直接使用 B 站 App 扫码，服务端会在后台每 10 秒轮询一次登录状态。</p>
-    <img src=\"{qrcode_data_url}\" alt=\"B 站登录二维码\" />
-    <div class=\"status\">
-      <p id=\"status\">状态：等待扫码</p>
-      <p id=\"message\">说明：二维码已生成，后台轮询已启动。</p>
-      <p id=\"poll-count\" class=\"meta\">轮询次数：0 / {LOGIN_MAX_POLLS}</p>
-      <p class=\"meta\">二维码 Key：{qrcode_key}</p>
-    </div>
-  </main>
-  <script>
-    const qrcodeKey = {qrcode_key_json};
-    const statusEl = document.getElementById("status");
-    const messageEl = document.getElementById("message");
-    const pollCountEl = document.getElementById("poll-count");
-
-    async function refreshLoginStatus() {{
-      try {{
-        const response = await fetch(`/login_poll?qrcode_key=${{encodeURIComponent(qrcodeKey)}}`, {{ cache: "no-store" }});
-        const data = await response.json();
-
-        statusEl.textContent = `状态：${{data.status || "unknown"}}`;
-        messageEl.textContent = `说明：${{data.message || "暂无状态说明"}}`;
-        pollCountEl.textContent = `轮询次数：${{data.poll_count || 0}} / {LOGIN_MAX_POLLS}`;
-
-        if (["success", "expired", "failed", "not_found"].includes(data.status)) {{
-          return;
-        }}
-      }} catch (error) {{
-        messageEl.textContent = `说明：状态查询失败，${{error}}`;
-      }}
-
-      setTimeout(refreshLoginStatus, 2000);
-    }}
-
-    refreshLoginStatus();
-  </script>
-</body>
-</html>
-"""
-
-
-async def fetch_json(
-    client: httpx.AsyncClient,
-    url: str,
-    *,
-    params: dict | None = None,
-    headers: dict[str, str] | None = None,
-) -> dict:
-    """统一处理 JSON 接口请求，便于复用错误检查。"""
-    response = await client.get(url, params=params, headers=headers)
-    response.raise_for_status()
-    return response.json()
-
-
-async def extract_bvid(url: str):
-    """兼容 b23 短链，必要时先跟随跳转再提取 BV 号。"""
-    if "b23.tv" in url:
-        async with httpx.AsyncClient(
-            headers=BASE_HEADERS,
-            follow_redirects=True,
-            timeout=CLIENT_TIMEOUT,
-        ) as client:
-            resp = await client.get(url)
-        url = str(resp.url)
-
-    m = re.search(r"BV([a-zA-Z0-9]{10})", url)
-    return "BV" + m.group(1) if m else None
-
-
-async def poll_login_status_task(qrcode_key: str) -> None:
-    """后台轮询 B 站登录状态，成功后把 Cookie 存入 Redis。"""
-    poll_url = "https://passport.bilibili.com/x/passport-login/web/qrcode/poll"
-
-    for attempt in range(1, LOGIN_MAX_POLLS + 1):
-        current_state = await load_login_state(qrcode_key)
-        if not current_state:
-            return
-
-        if current_state.get("status") in {"success", "expired", "failed"}:
-            return
-
-        async with httpx.AsyncClient(
-            headers=AUTH_HEADERS,
-            follow_redirects=True,
-            timeout=CLIENT_TIMEOUT,
-        ) as client:
-            try:
-                data = await fetch_json(
-                    client, poll_url, params={"qrcode_key": qrcode_key}
-                )
-            except Exception as exc:
-                await save_login_state(
-                    qrcode_key,
-                    {
-                        "status": "failed",
-                        "message": f"轮询异常：{exc}",
-                        "poll_count": str(attempt),
-                        "updated_at": now_iso(),
-                    },
-                )
-                return
-
-        poll_code = data.get("data", {}).get("code")
-
-        if poll_code in (-2, 86101):
-            await save_login_state(
-                qrcode_key,
-                {
-                    "status": "pending",
-                    "message": "等待扫码",
-                    "poll_count": str(attempt),
-                    "updated_at": now_iso(),
-                },
-            )
-        elif poll_code in (-4, 86090):
-            await save_login_state(
-                qrcode_key,
-                {
-                    "status": "pending",
-                    "message": "已扫码，等待手机确认",
-                    "poll_count": str(attempt),
-                    "updated_at": now_iso(),
-                },
-            )
-        elif poll_code == 0:
-            login_url = data["data"]["url"]
-            async with httpx.AsyncClient(
-                headers=AUTH_HEADERS,
-                follow_redirects=True,
-                timeout=CLIENT_TIMEOUT,
-            ) as client:
-                await client.get(login_url)
-                cookie_str = cookies_to_string(client.cookies)
-
-            await save_cookie(cookie_str)
-            await save_login_state(
-                qrcode_key,
-                {
-                    "status": "success",
-                    "message": "登录成功，Cookie 已写入 Redis",
-                    "poll_count": str(attempt),
-                    "cookie": cookie_str,
-                    "updated_at": now_iso(),
-                },
-            )
-            return
-        elif poll_code in (-5, 86038):
-            await save_login_state(
-                qrcode_key,
-                {
-                    "status": "expired",
-                    "message": "二维码已过期，请刷新页面重新获取",
-                    "poll_count": str(attempt),
-                    "updated_at": now_iso(),
-                },
-            )
-            return
-        else:
-            await save_login_state(
-                qrcode_key,
-                {
-                    "status": "failed",
-                    "message": f"未知登录状态：{poll_code}",
-                    "poll_count": str(attempt),
-                    "updated_at": now_iso(),
-                },
-            )
-            return
-
-        if attempt < LOGIN_MAX_POLLS:
-            await asyncio.sleep(LOGIN_POLL_INTERVAL_SECONDS)
-
-    await save_login_state(
-        qrcode_key,
-        {
-            "status": "expired",
-            "message": "轮询次数已达上限，请重新获取二维码",
-            "poll_count": str(LOGIN_MAX_POLLS),
-            "updated_at": now_iso(),
-        },
-    )
-
-
-# -----------------------------
-# 登录：获取二维码
+# 路由：首页
 # -----------------------------
 @app.get("/")
 async def index():
@@ -452,6 +108,9 @@ async def index():
     return HTMLResponse('<meta http-equiv="refresh" content="0; url=/login_qrcode" />')
 
 
+# -----------------------------
+# 路由：登录（获取二维码）
+# -----------------------------
 @app.get("/login_qrcode", response_class=HTMLResponse)
 async def login_qrcode(background_tasks: BackgroundTasks):
     """生成二维码页面，并在响应返回后启动后台轮询任务。"""
@@ -460,7 +119,7 @@ async def login_qrcode(background_tasks: BackgroundTasks):
     async with httpx.AsyncClient(
         headers=AUTH_HEADERS,
         follow_redirects=True,
-        timeout=CLIENT_TIMEOUT,
+        timeout=API_CLIENT_TIMEOUT,
     ) as client:
         resp = await fetch_json(client, api)
 
@@ -490,7 +149,7 @@ async def login_qrcode(background_tasks: BackgroundTasks):
 
 
 # -----------------------------
-# 登录：轮询二维码状态
+# 路由：轮询登录状态
 # -----------------------------
 @app.get("/login_poll")
 async def login_poll(qrcode_key: str):
@@ -510,157 +169,15 @@ async def login_poll(qrcode_key: str):
 
 
 # -----------------------------
-# 扫描收藏夹
+# 路由：扫描收藏夹
 # -----------------------------
-
-
-async def get_wbi_key(client):
-    resp = await client.get("https://api.bilibili.com/x/web-interface/nav")
-    data = resp.json()
-    img_url = data["data"]["wbi_img"]["img_url"]
-    sub_url = data["data"]["wbi_img"]["sub_url"]
-
-    img_key = img_url.split("/")[-1].split(".")[0]
-    sub_key = sub_url.split("/")[-1].split(".")[0]
-
-    return img_key + sub_key
-
-
-def wbi_sign(params: dict, wbi_key: str):
-    # 1. 添加 wts
-    params["wts"] = int(time.time())
-
-    # 2. 参数按 key 排序
-    sorted_params = "&".join(f"{k}={v}" for k, v in sorted(params.items()))
-
-    # 3. 拼接 key 做 MD5
-    md5 = hashlib.md5()
-    md5.update((sorted_params + wbi_key).encode("utf-8"))
-    params["w_rid"] = md5.hexdigest()
-
-    return params
-
-
-async def scan_fav(cookie: str, folder_name: str | None = None) -> list[dict]:
-    headers = {"Cookie": cookie, **BASE_HEADERS}
-
-    async with httpx.AsyncClient(headers=headers, timeout=CLIENT_TIMEOUT) as client:
-        # 获取 WBI key
-        wbi_key = await get_wbi_key(client)
-
-        # 获取 UID
-        nav_resp = await fetch_json(
-            client, "https://api.bilibili.com/x/web-interface/nav"
-        )
-        uid = nav_resp["data"]["mid"]
-
-        # 获取收藏夹列表
-        fav_resp = await fetch_json(
-            client,
-            f"https://api.bilibili.com/x/v3/fav/folder/created/list-all?up_mid={uid}",
-        )
-        favs = fav_resp["data"]["list"]
-
-        # -----------------------------
-        # ⭐ 过滤收藏夹（新增逻辑）
-        # -----------------------------
-        if folder_name:
-            favs = [f for f in favs if f["title"] == folder_name]
-            if not favs:
-                logger.info("未找到名称为《%s》的收藏夹", folder_name)
-                return []
-
-        new_bvs = []
-        seen = set()
-
-        for fav in favs:
-            media_id = fav["id"]
-            pn = 1
-
-            while True:
-                params = {"media_id": media_id, "pn": pn, "ps": 20}
-                params = wbi_sign(params, wbi_key)
-
-                resp = await fetch_json(
-                    client,
-                    "https://api.bilibili.com/x/v3/fav/resource/list",
-                    params=params,
-                )
-
-                medias = resp["data"]["medias"]
-                if not medias:
-                    break
-
-                for m in medias:
-                    bv = m["bv_id"]
-                    rid = m["id"]
-                    if bv and bv not in seen:
-                        seen.add(bv)
-                        if await r.sismember(REDIS_KEY, bv):
-                            continue
-                        download_status = await r.hget(video_state_key(bv), "download")
-                        if download_status in ("ready", "downloading"):
-                            continue
-                        new_bvs.append({"bv": bv, "rid": rid, "media_id": media_id})
-
-                pn += 1
-
-    return new_bvs
-
-
-async def delete_fav_item(
-    client: httpx.AsyncClient, media_id: int, rid: int, bili_jct: str
-):
-    """
-    使用 /x/v3/fav/resource/deal 从指定收藏夹删除单个视频
-    rid = 视频 ID（对应收藏里的那条资源）
-    media_id = 收藏夹 ID
-    """
-    url = "https://api.bilibili.com/x/v3/fav/resource/deal"
-
-    data = {
-        "rid": str(rid),  # ⭐ 视频 ID
-        "type": "2",  # 视频
-        "del_media_ids": str(media_id),  # ⭐ 要从哪个收藏夹删
-        "csrf": bili_jct,
-        "platform": "web",
-    }
-
-    resp = await client.post(url, data=data)
-    data = resp.json()
-
-    if data.get("code") != 0:
-        logger.error("删除收藏失败: %s", data)
-        return False
-
-    return True
-
-
-async def enqueue_ready_video(
-    bvid: str,
-    folder_name: str | None = None,
-) -> None:
-    """把待下载视频写入 Redis hash，并初始化下载状态字段。"""
-    now = now_iso()
-    await r.hset(
-        video_state_key(bvid),
-        mapping={
-            "bvid": bvid,
-            "download": "ready",
-            "created_at": now,
-            "updated_at": now,
-            "folder_name": folder_name or None,
-        },
-    )
-
-
 @app.get("/scan_fav")
 async def scan_fav_api(folder_name: str | None = None):
     """扫描收藏夹并把尚未处理的新视频写入 Redis ready 队列。"""
     cookie = await load_cookie()
     if not cookie:
         return {"error": "not logged in"}
-    if not folder_name:  # 新增必须指定收藏夹了
+    if not folder_name:
         return {"error": "folder_name is required"}
 
     lock_token = await acquire_scan_lock()
@@ -685,17 +202,13 @@ async def scan_fav_api(folder_name: str | None = None):
         async with httpx.AsyncClient(
             headers={"Cookie": cookie, **BASE_HEADERS}, timeout=30
         ) as client:
-            # wbi_key = await get_wbi_key(client)
-
             for item in new_items:
                 bv = item["bv"]
                 rid = item["rid"]
                 media_id = item["media_id"]
-                # 加入队列
                 await enqueue_ready_video(bv, folder_name)
                 queued.append(bv)
 
-                # 删除收藏夹内容
                 ok = await delete_fav_item(client, media_id, rid, bili_jct)
                 if ok:
                     logger.info("已从收藏夹删除 BV=%s (rid=%s)", bv, rid)
@@ -707,89 +220,12 @@ async def scan_fav_api(folder_name: str | None = None):
         await release_scan_lock(lock_token)
 
 
-def extract_bili_jct(cookie: str) -> str | None:
-    for part in cookie.split(";"):
-        part = part.strip()
-        if part.startswith("bili_jct="):
-            return part.split("=", 1)[1]
-    return None
-
-
-async def fetch_fav_all_items(cookie: str, folder_name: str):
-    """
-    获取指定收藏夹的全部内容，返回 [{bv, rid, title}]
-    """
-    headers = {"Cookie": cookie, **BASE_HEADERS}
-
-    async with httpx.AsyncClient(headers=headers, timeout=CLIENT_TIMEOUT) as client:
-        # 获取 WBI key
-        wbi_key = await get_wbi_key(client)
-
-        # 获取 UID
-        nav_resp = await fetch_json(
-            client, "https://api.bilibili.com/x/web-interface/nav"
-        )
-        uid = nav_resp["data"]["mid"]
-
-        # 获取收藏夹列表
-        fav_resp = await fetch_json(
-            client,
-            f"https://api.bilibili.com/x/v3/fav/folder/created/list-all?up_mid={uid}",
-        )
-        favs = fav_resp["data"]["list"]
-
-        # 找到指定收藏夹
-        target = None
-        for f in favs:
-            if f["title"] == folder_name:
-                target = f
-                break
-
-        if not target:
-            return {"error": f"未找到名称为《{folder_name}》的收藏夹"}
-
-        media_id = target["id"]
-
-        # 开始分页读取收藏夹内容
-        results = []
-        pn = 1
-
-        while True:
-            params = {"media_id": media_id, "pn": pn, "ps": 20}
-            params = wbi_sign(params, wbi_key)
-
-            resp = await fetch_json(
-                client,
-                "https://api.bilibili.com/x/v3/fav/resource/list",
-                params=params,
-            )
-
-            medias = resp["data"]["medias"]
-            if not medias:
-                break
-
-            for m in medias:
-                bv = m.get("bv_id")
-                rid = m.get("id")
-                title = m.get("title")
-
-                if bv:
-                    results.append(
-                        {
-                            "bv": bv,
-                            "rid": rid,
-                            "title": title,
-                        }
-                    )
-
-            pn += 1
-
-        return results
-
-
+# -----------------------------
+# 路由：查看收藏夹内容
+# -----------------------------
 @app.get("/fav_items")
 async def fav_items(folder_name: str):
-    """获取指定收藏夹的全部内容，返回 [{bv, rid, title}]"""
+    """获取指定收藏夹的全部内容，返回 [{bv, rid, title}]。"""
     cookie = await load_cookie()
     if not cookie:
         return {"error": "not logged in"}
@@ -798,33 +234,16 @@ async def fav_items(folder_name: str):
     return data
 
 
-async def get_media_id_by_name(
-    client: httpx.AsyncClient, uid: int, folder_name: str
-) -> int | None:
-    """根据收藏夹名称获取 media_id"""
-    resp = await fetch_json(
-        client,
-        f"https://api.bilibili.com/x/v3/fav/folder/created/list-all?up_mid={uid}",
-    )
-    favs = resp["data"]["list"]
-
-    for f in favs:
-        if f["title"] == folder_name:
-            return f["id"]
-
-    return None
-
-
+# -----------------------------
+# 路由：从收藏夹删除单个视频
+# -----------------------------
 @app.get("/fav_delete")
 async def fav_delete(folder_name: str, rid: int):
-    """
-    删除指定收藏夹中的指定视频（传入 rid）
-    """
+    """删除指定收藏夹中的指定视频（传入 rid）。"""
     cookie = await load_cookie()
     if not cookie:
         return {"error": "not logged in"}
 
-    # 提取 bili_jct（删除操作必须）
     bili_jct = extract_bili_jct(cookie)
     if not bili_jct:
         return {"error": "cookie missing bili_jct"}
@@ -832,19 +251,13 @@ async def fav_delete(folder_name: str, rid: int):
     async with httpx.AsyncClient(
         headers={"Cookie": cookie, **BASE_HEADERS}, timeout=30
     ) as client:
-        # 获取 UID
         nav = await fetch_json(client, "https://api.bilibili.com/x/web-interface/nav")
         uid = nav["data"]["mid"]
 
-        # 获取收藏夹 media_id
         media_id = await get_media_id_by_name(client, uid, folder_name)
         if not media_id:
             return {"error": f"未找到名称为《{folder_name}》的收藏夹"}
 
-        # 获取 WBI key
-        # wbi_key = await get_wbi_key(client)
-
-        # 调用删除接口
         ok = await delete_fav_item(client, media_id, rid, bili_jct)
 
         if ok:
@@ -864,7 +277,7 @@ async def fav_delete(folder_name: str, rid: int):
 
 
 # -----------------------------
-# 下载触发接口
+# 路由：触发下载
 # -----------------------------
 @app.post("/download")
 async def trigger_download(background_tasks: BackgroundTasks):
@@ -879,99 +292,39 @@ async def trigger_download(background_tasks: BackgroundTasks):
     lock_held = await r.exists(DOWNLOAD_LOCK_KEY)
     if lock_held:
         progress = await r.get(DOWNLOAD_LOCK_KEY)
-        return {"status": "busy", "message": "下载任务正在执行中", "progress": progress}
+        return {
+            "status": "busy",
+            "message": "下载任务正在执行中",
+            "progress": progress,
+        }
 
     if DOWNLOAD_MODE == "sync":
-        # 同步模式：等待全部下载完成后再返回响应
         await _run_downloader()
         return {"status": "ok", "message": "下载任务已完成（sync 模式）"}
 
-    # 后台模式：注册 BackgroundTask，接口立即返回
     background_tasks.add_task(_run_downloader)
     return {"status": "ok", "message": "下载任务已启动（bg 模式）"}
 
 
+# -----------------------------
+# 路由：下载进度查询
+# -----------------------------
 @app.get("/download/status")
 async def download_status():
     """查询下载锁状态及当前进度。
 
     返回字段：
       running  : 是否有下载任务正在执行
-      progress : 当前进度，格式 "{done}-{total}"，例如 "1-4" 表示共 4 条已完成 1 条；
+      progress : 当前进度，格式 "{done}-{total}"，例如 "1-4"；
                  任务未运行时为 null
     """
     progress = await r.get(DOWNLOAD_LOCK_KEY)
     return {"running": bool(progress), "progress": progress}
 
 
-# ------------------------------
-# 获取指定up的视频动态列表
-# ------------------------------
-
-
-async def fetch_all_up_video_dynamic(uid: int, cookie: str):
-    """
-    自动翻页 + WBI 签名
-    只获取视频动态（DYNAMIC_TYPE_AV）
-    """
-    headers = {
-        "Cookie": cookie,
-        "User-Agent": "Mozilla/5.0",
-        "Referer": f"https://space.bilibili.com/{uid}/dynamic",
-        "Origin": "https://www.bilibili.com",
-    }
-
-    offset = ""
-    results = []
-
-    async with httpx.AsyncClient(headers=headers, timeout=10) as client:
-        # ⭐ 必须先获取 WBI key
-        wbi_key = await get_wbi_key(client)
-
-        while True:
-            params = {
-                "host_mid": uid,
-                "offset": offset,
-            }
-            params = wbi_sign(params, wbi_key)
-
-            resp = await client.get(
-                "https://api.bilibili.com/x/polymer/web-dynamic/v1/feed/space",
-                params=params,
-            )
-            data = resp.json()
-
-            if data.get("code") != 0:
-                return {"error": "获取动态失败", "raw": data}
-
-            items = data["data"]["items"]
-            if not items:
-                break
-
-            for item in items:
-                if item["type"] != "DYNAMIC_TYPE_AV":
-                    continue
-
-                archive = item["modules"]["module_dynamic"]["major"]["archive"]
-
-                results.append(
-                    {
-                        "type": "video",
-                        "dynamic_id": item["id_str"],
-                        "title": archive["title"],
-                        "bv": archive["bvid"],
-                        "cover": archive["cover"],
-                        "desc": archive.get("desc", ""),
-                        "pubtime": item["modules"]["module_author"]["pub_ts"],
-                    }
-                )
-            offset = data["data"]["offset"]
-            if not offset:
-                break
-
-    return results
-
-
+# -----------------------------
+# 路由：获取指定 UP 主的视频动态
+# -----------------------------
 @app.get("/up_video_dynamic_all")
 async def up_video_dynamic_all(uid: int):
     """获取指定 UP 主的全部视频动态，并将 BV 写入待下载队列。"""
@@ -986,96 +339,53 @@ async def up_video_dynamic_all(uid: int):
     queued = []
     for item in data:
         bv = item["bv"]
-        if await r.sismember(REDIS_KEY, bv):
+        if await is_video_downloaded(bv):
             continue
-        download_status = await r.hget(video_state_key(bv), "download")
+        download_status = await get_video_download_status(bv)
         if download_status in ("ready", "downloading", "done"):
             continue
         await enqueue_ready_video(bv)
         queued.append(bv)
 
-    return {"status": "ok", "uid": uid, "queued": queued, "total_fetched": len(data)}
-
-
-# -----------------------------
-# 获取指定用户的最新动态
-# -----------------------------
-
-
-async def fetch_latest_up_video_dynamic(uid: int, cookie: str):
-    """
-    只检查 UP 主最新的视频动态（不翻页）
-    返回：最新视频动态 或 None
-    """
-    headers = {
-        "Cookie": cookie,
-        "User-Agent": "Mozilla/5.0",
-        "Referer": f"https://space.bilibili.com/{uid}/dynamic",
+    return {
+        "status": "ok",
+        "uid": uid,
+        "queued": queued,
+        "total_fetched": len(data),
     }
 
-    async with httpx.AsyncClient(headers=headers, timeout=10) as client:
-        # WBI key
-        wbi_key = await get_wbi_key(client)
 
-        params = {"host_mid": uid, "offset": ""}
-        params = wbi_sign(params, wbi_key)
-
-        resp = await client.get(
-            "https://api.bilibili.com/x/polymer/web-dynamic/v1/feed/space",
-            params=params,
-        )
-        data = resp.json()
-
-    if data.get("code") != 0:
-        return None
-
-    items = data["data"]["items"]
-
-    for item in items:
-        if item["type"] != "DYNAMIC_TYPE_AV":
-            continue
-
-        archive = item["modules"]["module_dynamic"]["major"]["archive"]
-
-        return {
-            "dynamic_id": item["id_str"],
-            "title": archive["title"],
-            "bv": archive["bvid"],
-            "cover": archive["cover"],
-            "desc": archive.get("desc", ""),
-            "pubtime": item["modules"]["module_author"]["pub_ts"],
-        }
-
-    return None
-
-
+# -----------------------------
+# 路由：检查多个 UP 主是否有新视频动态
+# -----------------------------
 @app.get("/check_up_new_video")
 async def check_up_new_video(uids: list[int] = Query(...)):
-    """
-    检查多个 UP 主是否有新视频动态。
-    - 首次见到该 UP：记录 id_str，入队 BV
-    - id_str 未变化：跳过
-    - id_str 有变化：更新 id_str，入队新 BV
+    """检查多个 UP 主是否有新视频动态。
+
+    - 首次见到该 UP：记录 dynamic_id，入队 BV
+    - dynamic_id 未变化：跳过
+    - dynamic_id 有变化：更新 dynamic_id，入队新 BV
     """
     cookie = await load_cookie()
     if not cookie:
         return {"error": "not logged in"}
 
-    summary: dict = {}
+    summary = {}
     for uid in uids:
+        redis_key = f"{UP_DYNAMIC_PREFIX}{uid}"
+        stored_id = await r.get(redis_key)
+
         latest = await fetch_latest_up_video_dynamic(uid, cookie)
-        if not latest:
-            summary[str(uid)] = {"error": "获取失败"}
+        if latest is None:
+            summary[str(uid)] = {"new": False, "action": "no_dynamic"}
             continue
 
-        dynamic_id: str = latest["dynamic_id"]
-        bv: str = latest["bv"]
-        redis_key = f"{UP_DYNAMIC_PREFIX}{uid}"
-        stored_id: str | None = await r.get(redis_key)
+        dynamic_id = latest["dynamic_id"]
+        bv = latest["bv"]
 
         if stored_id is None:
             await r.set(redis_key, dynamic_id)
-            # await enqueue_ready_video(bv)
+            await enqueue_ready_video(bv)
             summary[str(uid)] = {
                 "new": True,
                 "action": "first_seen",
@@ -1099,63 +409,11 @@ async def check_up_new_video(uids: list[int] = Query(...)):
 
 
 # -----------------------------
-# 获取关注的所有up
+# 路由：获取关注的所有 UP 主
 # -----------------------------
-
-
-async def fetch_followings(cookie: str):
-    """
-    获取当前账号关注的所有 UP 主
-    返回：[{uid, name, sex}]
-    """
-    headers = {
-        "Cookie": cookie,
-        "User-Agent": "Mozilla/5.0",
-        "Referer": "https://space.bilibili.com",
-    }
-
-    async with httpx.AsyncClient(headers=headers, timeout=10) as client:
-        # 1. 获取自己的 UID
-        nav = await client.get("https://api.bilibili.com/x/web-interface/nav")
-        nav_data = nav.json()
-        if nav_data.get("code") != 0:
-            return {"error": "无法获取用户信息", "raw": nav_data}
-
-        uid = nav_data["data"]["mid"]
-
-        # 2. 分页获取关注列表
-        page = 1
-        results = []
-
-        while True:
-            resp = await client.get(
-                "https://api.bilibili.com/x/relation/followings",
-                params={"vmid": uid, "pn": page, "ps": 50, "order": "desc"},
-            )
-            data = resp.json()
-
-            if data.get("code") != 0:
-                return {"error": "获取关注列表失败", "raw": data}
-
-            list_data = data["data"].get("list") or []
-            if not list_data:
-                break
-
-            for item in list_data:
-                results.append(
-                    {
-                        "uid": item["mid"],
-                        "name": item["uname"],
-                    }
-                )
-
-            page += 1
-
-        return results
-
-
 @app.get("/my_followings")
 async def my_followings():
+    """获取当前账号关注的所有 UP 主列表。"""
     cookie = await load_cookie()
     if not cookie:
         return {"error": "not logged in"}
@@ -1165,13 +423,13 @@ async def my_followings():
 
 
 # -----------------------------
-# Cookie 保活接口（定期调用）
+# 路由：Cookie 保活
 # -----------------------------
 @app.get("/keep_alive")
 async def keep_alive():
-    """
-    你可以用定时任务定期请求这个接口，
-    它会访问一次需要登录的接口，帮助 Cookie 续期。
+    """Cookie 保活接口。
+
+    定期调用此接口会访问一次需要登录的 B 站接口，帮助 Cookie 续期。
     """
     cookie = await load_cookie()
     if not cookie:
@@ -1181,7 +439,7 @@ async def keep_alive():
     async with httpx.AsyncClient(
         headers=headers,
         follow_redirects=True,
-        timeout=CLIENT_TIMEOUT,
+        timeout=API_CLIENT_TIMEOUT,
     ) as client:
         response = await client.get("https://api.bilibili.com/x/web-interface/nav")
 
@@ -1197,11 +455,11 @@ async def keep_alive():
 
 
 # -----------------------------
-# 健康检查
+# 路由：健康检查
 # -----------------------------
 @app.get("/health")
 async def health():
-    """检查 Redis 连接、ffmpeg 可用性以及登录状态。"""
+    """健康检查：Redis 连接、ffmpeg 可用性、登录状态、B 站连通性。"""
     result: dict = {}
 
     # Redis 连通性
@@ -1248,20 +506,23 @@ async def health():
     overall = (
         "ok" if all(v == "ok" or v is True for v in result.values()) else "degraded"
     )
-    return {"status": overall, **result}
+    result["overall"] = overall
+    return result
 
 
 # -----------------------------
-# 启动
+# CLI 入口：启动 uvicorn 服务
 # -----------------------------
 def main() -> None:
-    """CLI 入口：启动 FastAPI 服务。"""
+    """启动 Bili-Auto API 服务。
+
+    监听地址和端口通过环境变量 SERVICE_HOST / SERVICE_PORT 控制，
+    默认 0.0.0.0:8000。
+    """
+    import os
+
     import uvicorn
 
     host = os.getenv("SERVICE_HOST", "0.0.0.0")
     port = int(os.getenv("SERVICE_PORT", "8000"))
     uvicorn.run(app, host=host, port=port)
-
-
-if __name__ == "__main__":
-    main()
