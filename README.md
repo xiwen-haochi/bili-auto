@@ -46,23 +46,23 @@ uv add bili-auto
 cp .env.example .env
 ```
 
-| 变量 | 默认值 | 说明 |
-|---|---|---|
-| `SERVICE_HOST` | `0.0.0.0` | 服务监听 IP |
-| `SERVICE_PORT` | `8000` | 服务监听端口 |
-| `REDIS_HOST` | `localhost` | Redis 主机 |
-| `REDIS_PORT` | `6379` | Redis 端口 |
-| `REDIS_DB` | `0` | Redis 数据库编号 |
-| `REDIS_PASSWORD` | 无 | Redis 密码（不填则不鉴权） |
-| `API_KEY` | 无 | API 鉴权密钥，所有请求须携带 `X-API-Key` header |
-| `DOWNLOAD_DIR` | `./downloads` | 视频保存根目录 |
-| `MAX_DOWNLOADS_PER_RUN` | `10` | 每次 downloader 最多下载数 |
-| `DOWNLOAD_INTERVAL_SECONDS` | `3` | 视频下载间隔（秒） |
-| `VIDEO_DONE_TTL_SECONDS` | `10800` | done 状态 hash 过期时间（秒） |
-| `LOGIN_MAX_POLLS` | `5` | 登录轮询最大次数 |
-| `LOGIN_POLL_INTERVAL_SECONDS` | `10` | 登录轮询间隔（秒） |
-| `MAX_MP4_SIZE` | 无 | 每个视频的大小，如1g，500m，1024 |
-| `DOWNLOAD_MODE` | `bg` | 同步或者异步下载，bg或者sync |
+| 变量                          | 默认值        | 说明                                            |
+| ----------------------------- | ------------- | ----------------------------------------------- |
+| `SERVICE_HOST`                | `0.0.0.0`     | 服务监听 IP                                     |
+| `SERVICE_PORT`                | `8000`        | 服务监听端口                                    |
+| `REDIS_HOST`                  | `localhost`   | Redis 主机                                      |
+| `REDIS_PORT`                  | `6379`        | Redis 端口                                      |
+| `REDIS_DB`                    | `0`           | Redis 数据库编号                                |
+| `REDIS_PASSWORD`              | 无            | Redis 密码（不填则不鉴权）                      |
+| `API_KEY`                     | 无            | API 鉴权密钥，所有请求须携带 `X-API-Key` header |
+| `DOWNLOAD_DIR`                | `./downloads` | 视频保存根目录                                  |
+| `MAX_DOWNLOADS_PER_RUN`       | `10`          | 每次 downloader 最多下载数                      |
+| `DOWNLOAD_INTERVAL_SECONDS`   | `3`           | 视频下载间隔（秒）                              |
+| `VIDEO_DONE_TTL_SECONDS`      | `10800`       | done 状态 hash 过期时间（秒）                   |
+| `LOGIN_MAX_POLLS`             | `5`           | 登录轮询最大次数                                |
+| `LOGIN_POLL_INTERVAL_SECONDS` | `10`          | 登录轮询间隔（秒）                              |
+| `MAX_MP4_SIZE`                | 无            | 每个视频的大小，如1g，500m，1024                |
+| `DOWNLOAD_MODE`               | `bg`          | 同步或者异步下载，bg或者sync                    |
 
 ## 使用
 
@@ -174,13 +174,13 @@ curl http://localhost:8000/health
 }
 ```
 
-| 字段 | 说明 |
-|---|---|
-| `status` | 整体状态：`ok` 全部正常，`degraded` 有项异常 |
-| `redis` | Redis 连通性（`ok` 或错误信息） |
-| `ffmpeg` | ffmpeg 版本行（`ok` 状态下）或错误信息 |
-| `logged_in` | 是否已有登录 Cookie |
-| `bilibili_api` | B 站接口是否可达 |
+| 字段           | 说明                                         |
+| -------------- | -------------------------------------------- |
+| `status`       | 整体状态：`ok` 全部正常，`degraded` 有项异常 |
+| `redis`        | Redis 连通性（`ok` 或错误信息）              |
+| `ffmpeg`       | ffmpeg 版本行（`ok` 状态下）或错误信息       |
+| `logged_in`    | 是否已有登录 Cookie                          |
+| `bilibili_api` | B 站接口是否可达                             |
 
 ## systemd 服务（Linux）
 
@@ -247,12 +247,16 @@ bili-auto/
 
 ## Redis 数据结构
 
-| Key | 类型 | 说明 |
-|---|---|---|
-| `bili:downloaded` | Set | 已完成下载的 BV 号 |
-| `bili:auth:cookie` | String | 当前登录 Cookie |
-| `bili:video:{bvid}` | Hash | 单视频状态（download: ready/downloading/done/failed） |
-| `bili:login:{key}` | Hash | 二维码登录状态，10 分钟过期 |
-| `bili:scan_fav:lock` | String | 扫描锁 |
-| `bili:download:lock` | String | 下载锁 |
-| `bili:up:dynamic:{uid}` | String | UP 主最新视频动态 id_str，用于检测更新 |
+| Key                     | 类型   | 说明                                                  |
+| ----------------------- | ------ | ----------------------------------------------------- |
+| `bili:downloaded`       | Set    | 已完成下载的 BV 号                                    |
+| `bili:auth:cookie`      | String | 当前登录 Cookie                                       |
+| `bili:video:{bvid}`     | Hash   | 单视频状态（download: ready/downloading/done/failed） |
+| `bili:login:{key}`      | Hash   | 二维码登录状态，10 分钟过期                           |
+| `bili:scan_fav:lock`    | String | 扫描锁                                                |
+| `bili:download:lock`    | String | 下载锁                                                |
+| `bili:up:dynamic:{uid}` | String | UP 主最新视频动态 id_str，用于检测更新                |
+
+## openapi 文档
+
+启动服务后，访问 `http://localhost:8000/docs` 查看 openapi 文档。
