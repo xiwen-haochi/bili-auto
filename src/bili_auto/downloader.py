@@ -173,6 +173,36 @@ async def merge_av(video_file: Path, audio_file: Path, output_file: Path) -> Non
         raise RuntimeError("ffmpeg 合并失败，请确认本机已安装 ffmpeg")
 
 
+async def _merge_durl_segments(segment_files: list[Path], output_file: Path) -> None:
+    """使用 ffmpeg concat 协议合并多段 durl mp4 片段。
+
+    durl 格式的视频可能被 B 站切分为多段（通常每段约 6 分钟），
+    下载后需用本函数合并为一个完整 mp4 文件，无需重新编码。
+
+    Args:
+        segment_files: 按播放顺序排列的分段文件路径列表。
+        output_file: 合并后的 mp4 输出路径。
+
+    Raises:
+        RuntimeError: ffmpeg 执行失败时抛出。
+    """
+    concat_input = "|".join(str(p) for p in segment_files)
+    process = await asyncio.create_subprocess_exec(
+        "ffmpeg",
+        "-y",
+        "-i",
+        f"concat:{concat_input}",
+        "-c",
+        "copy",
+        str(output_file),
+        stdout=asyncio.subprocess.DEVNULL,
+        stderr=asyncio.subprocess.DEVNULL,
+    )
+    await process.communicate()
+    if process.returncode != 0:
+        raise RuntimeError("ffmpeg 合并 durl 分段失败，请确认本机已安装 ffmpeg")
+
+
 async def _probe_duration(path: Path) -> float:
     """用 ffprobe 读取媒体文件的总时长（秒）。
 
@@ -307,21 +337,6 @@ async def download_bv(bvid: str, cookie: str) -> None:
         if play_resp.get("code") != 0:
             raise RuntimeError(f"获取播放地址失败：{play_resp}")
 
-        dash = play_resp.get("data", {}).get("dash", {})
-        videos = dash.get("video") or []
-        audios = dash.get("audio") or []
-
-        if not videos or not audios:
-            raise RuntimeError(f"当前视频未返回 DASH 音视频流：{play_resp}")
-
-        best_video = select_best_video_stream(videos)
-        best_audio = select_best_audio_stream(audios)
-        video_url = get_stream_url(best_video)
-        audio_url = get_stream_url(best_audio)
-
-        if not video_url or not audio_url:
-            raise RuntimeError(f"无法解析音视频下载地址：{play_resp}")
-
         safe_author = sanitize_title(author)
         clean_title = sanitize_title(title)
 
@@ -332,16 +347,90 @@ async def download_bv(bvid: str, cookie: str) -> None:
 
         video_dir.mkdir(parents=True, exist_ok=True)
 
-        video_file = video_dir / f"{bvid}_video.m4s"
-        audio_file = video_dir / f"{bvid}_audio.m4s"
         output_file = video_dir / f"{clean_title}.mp4"
 
-        await download_file(client, video_url, video_file)
-        await download_file(client, audio_url, audio_file)
+        dash = play_resp.get("data", {}).get("dash", {})
+        videos = dash.get("video") or []
+        audios = dash.get("audio") or []
 
-    await merge_av(video_file, audio_file, output_file)
-    video_file.unlink(missing_ok=True)
-    audio_file.unlink(missing_ok=True)
+        # 用于标记当前视频使用的是 DASH 模式还是 durl 回退模式
+        is_dash = False
+
+        if videos and audios:
+            # DASH 模式：分别下载视频流和音频流，之后用 ffmpeg 合并
+            is_dash = True
+
+            best_video = select_best_video_stream(videos)
+            best_audio = select_best_audio_stream(audios)
+            video_url = get_stream_url(best_video)
+            audio_url = get_stream_url(best_audio)
+
+            if not video_url or not audio_url:
+                raise RuntimeError(f"无法解析 DASH 音视频下载地址：{play_resp}")
+
+            video_file = video_dir / f"{bvid}_video.m4s"
+            audio_file = video_dir / f"{bvid}_audio.m4s"
+
+            await download_file(client, video_url, video_file)
+            await download_file(client, audio_url, audio_file)
+        else:
+            # durl 回退模式：部分视频无 DASH 流，使用传统直链 mp4
+            # 注意：fnval=16 请求下非DASH视频的 durl 可能不完整（仅预览片段），
+            # 需用 fnval=1 重新请求以获取完整分段
+            logger.info("BV %s 无 DASH 流，切换到 durl（非DASH）格式下载", bvid)
+
+            durl_play_resp = await fetch_json(
+                client,
+                "https://api.bilibili.com/x/player/playurl",
+                params={
+                    "bvid": bvid,
+                    "cid": cid,
+                    "qn": 127,
+                    "fnval": 1,
+                    "fourk": 1,
+                },
+            )
+
+            if durl_play_resp.get("code") != 0:
+                raise RuntimeError(f"获取 durl 播放地址失败：{durl_play_resp}")
+
+            durl_list = durl_play_resp.get("data", {}).get("durl") or []
+            if not durl_list:
+                raise RuntimeError(f"当前视频未返回 DASH 音视频流，也无 durl 直链")
+
+            if len(durl_list) == 1:
+                # 单段 durl：直接下载即为完整 mp4
+                video_url = durl_list[0].get("url")
+                if not video_url:
+                    raise RuntimeError("无法解析 durl 下载地址")
+                await download_file(client, video_url, output_file)
+            else:
+                # 多段 durl：逐段下载，然后用 ffmpeg concat 合并
+                segment_files: list[Path] = []
+                for i, segment in enumerate(durl_list, 1):
+                    seg_url = segment.get("url")
+                    if not seg_url:
+                        logger.warning(
+                            "durl 第 %d 段无有效 URL，跳过", segment.get("order", i)
+                        )
+                        continue
+                    seg_file = video_dir / f"{bvid}_seg_{i:03d}.mp4"
+                    await download_file(client, seg_url, seg_file)
+                    segment_files.append(seg_file)
+
+                if not segment_files:
+                    raise RuntimeError("durl 分段均无有效下载地址")
+
+                logger.info("BV %s durl 共 %d 段，开始合并", bvid, len(segment_files))
+                await _merge_durl_segments(segment_files, output_file)
+                for sf in segment_files:
+                    sf.unlink(missing_ok=True)
+
+    # DASH 模式需要在退出 client 上下文后合并音视频
+    if is_dash:
+        await merge_av(video_file, audio_file, output_file)
+        video_file.unlink(missing_ok=True)
+        audio_file.unlink(missing_ok=True)
 
     if MAX_MP4_SIZE is not None and output_file.stat().st_size > MAX_MP4_SIZE:
         file_mb = output_file.stat().st_size / 1024 / 1024

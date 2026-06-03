@@ -393,7 +393,7 @@ async def download_up_all_photos(
 async def main():
 
     # 搜索示例
-    # print(await search_up("邓紫棋", download_avatar=True))
+    print(await search_up("吱吱", download_avatar=True))
     #       348710707
 
     # 获取 UP 信息
@@ -402,7 +402,7 @@ async def main():
 
     # 20260522 使用过
     # 下载 UP 主所有图片动态（基本用法）
-    result = await download_up_all_photos(mid=1889545341)
+    result = await download_up_all_photos(mid=11616487)
     print(result)
 
     # 仅阅读最近 50 条动态中的图片动态

@@ -141,3 +141,7 @@ cython_debug/
 __uv/
 .python-version
 uv.lock
+
+demo.py
+
+logs/
