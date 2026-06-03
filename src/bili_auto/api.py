@@ -42,6 +42,7 @@ from bili_auto.downloader import async_main as _run_downloader
 from bili_auto.redis_client import (
     acquire_scan_lock,
     enqueue_ready_video,
+    get_max_duration_seconds,
     get_video_download_status,
     is_video_downloaded,
     load_cookie,
@@ -326,24 +327,76 @@ async def download_status():
 # 路由：获取指定 UP 主的视频动态
 # -----------------------------
 @app.get("/up_video_dynamic_all")
-async def up_video_dynamic_all(uid: int):
-    """获取指定 UP 主的全部视频动态，并将 BV 写入待下载队列。"""
+async def up_video_dynamic_all(uid: int, run_try: bool = False, count: int = 0):
+    """获取指定 UP 主的全部视频动态，并将 BV 写入待下载队列。
+
+    视频时长过滤阈值从 Redis 读取（key: bili:config:max_duration_seconds，
+    单位秒），仅在值存在且大于 0 时生效。
+
+    Args:
+        uid: UP 主的 B 站 UID。
+        run_try: 试运行模式，仅返回所有视频的 BV/时长/标题，不入队。
+        count: 最多获取的视频动态数量，0 表示不限制。
+    """
     cookie = await load_cookie()
     if not cookie:
         return {"error": "not logged in"}
 
-    data = await fetch_all_up_video_dynamic(uid, cookie)
+    # 从 Redis 读取时长过滤阈值（秒），不存在或为 0 时不过滤
+    max_duration = await get_max_duration_seconds()
+    data = await fetch_all_up_video_dynamic(uid, cookie, max_count=count)
     if isinstance(data, dict) and "error" in data:
         return data
 
+    # 试运行模式：不入队，仅返回所有视频的基本信息
+    if run_try:
+        if max_duration and max_duration > 0:
+            logger.info("max_duration_seconds: %s", max_duration)
+            preview = [
+                {
+                    "BV": item["bv"],
+                    "duration": item.get("duration", 0),
+                    "title": item["title"],
+                }
+                for item in data
+                if item.get("duration", 0) <= max_duration
+            ]
+        else:
+            preview = [
+                {
+                    "BV": item["bv"],
+                    "duration": item.get("duration", 0),
+                    "title": item["title"],
+                }
+                for item in data
+            ]
+
+        logger.info("run_try preview (uid=%s): %s", uid, preview)
+        return {
+            "status": "ok",
+            "uid": uid,
+            "total_fetched": len(data),
+            "preview": preview,
+        }
+
     queued = []
+    skipped_duration = 0  # 因时长超限被跳过的视频数
     for item in data:
         bv = item["bv"]
+
+        # 已下载或已在队列中的视频直接跳过
         if await is_video_downloaded(bv):
             continue
         download_status = await get_video_download_status(bv)
         if download_status in ("ready", "downloading", "done"):
             continue
+
+        # 时长过滤：超过阈值的视频不入队
+        video_duration_sec = item.get("duration", 0)
+        if max_duration and max_duration > 0 and video_duration_sec > max_duration:
+            skipped_duration += 1
+            continue
+
         await enqueue_ready_video(bv)
         queued.append(bv)
 
@@ -352,6 +405,8 @@ async def up_video_dynamic_all(uid: int):
         "uid": uid,
         "queued": queued,
         "total_fetched": len(data),
+        "skipped_duration": skipped_duration,
+        "max_duration_seconds": max_duration,
     }
 
 

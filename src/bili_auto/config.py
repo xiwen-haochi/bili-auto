@@ -33,6 +33,11 @@ SCAN_FAV_LOCK_KEY = os.getenv("SCAN_FAV_LOCK_KEY", "bili:scan_fav:lock")
 DOWNLOAD_LOCK_KEY = os.getenv("DOWNLOAD_LOCK_KEY", "bili:download:lock")
 UP_DYNAMIC_PREFIX = os.getenv("UP_DYNAMIC_PREFIX", "bili:up:dynamic:")
 
+# 视频时长过滤阈值（单位：秒），超过该时长的视频不入队
+MAX_DURATION_SECONDS_KEY = os.getenv(
+    "MAX_DURATION_SECONDS_KEY", "bili:config:max_duration_seconds"
+)
+
 # -----------------------------
 # 扫描收藏夹参数
 # -----------------------------
@@ -95,9 +100,7 @@ def _parse_size(value: str) -> int:
 
 # MAX_MP4_SIZE：合并后单个 mp4 的最大字节数；超出则自动分割为多段。
 _MAX_MP4_SIZE_STR = os.getenv("MAX_MP4_SIZE")
-MAX_MP4_SIZE: int | None = (
-    _parse_size(_MAX_MP4_SIZE_STR) if _MAX_MP4_SIZE_STR else None
-)
+MAX_MP4_SIZE: int | None = _parse_size(_MAX_MP4_SIZE_STR) if _MAX_MP4_SIZE_STR else None
 
 # -----------------------------
 # HTTP 客户端超时参数

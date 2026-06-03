@@ -36,6 +36,7 @@ from bili_auto.utils import (
     fetch_json,
     get_wbi_key,
     now_iso,
+    parse_duration_text,
     wbi_sign,
 )
 
@@ -178,9 +179,7 @@ async def scan_fav(cookie: str, folder_name: str | None = None) -> list[dict]:
     """
     headers = {"Cookie": cookie, **BASE_HEADERS}
 
-    async with httpx.AsyncClient(
-        headers=headers, timeout=API_CLIENT_TIMEOUT
-    ) as client:
+    async with httpx.AsyncClient(headers=headers, timeout=API_CLIENT_TIMEOUT) as client:
         wbi_key = await get_wbi_key(client)
 
         nav_resp = await fetch_json(
@@ -231,9 +230,7 @@ async def scan_fav(cookie: str, folder_name: str | None = None) -> list[dict]:
                         download_status = await get_video_download_status(bv)
                         if download_status in ("ready", "downloading"):
                             continue
-                        new_bvs.append(
-                            {"bv": bv, "rid": rid, "media_id": media_id}
-                        )
+                        new_bvs.append({"bv": bv, "rid": rid, "media_id": media_id})
 
                 pn += 1
 
@@ -292,9 +289,7 @@ async def fetch_fav_all_items(cookie: str, folder_name: str) -> list[dict]:
     """
     headers = {"Cookie": cookie, **BASE_HEADERS}
 
-    async with httpx.AsyncClient(
-        headers=headers, timeout=API_CLIENT_TIMEOUT
-    ) as client:
+    async with httpx.AsyncClient(headers=headers, timeout=API_CLIENT_TIMEOUT) as client:
         wbi_key = await get_wbi_key(client)
 
         nav_resp = await fetch_json(
@@ -501,15 +496,18 @@ async def get_media_id_by_name(
 # -----------------------------
 # UP 主动态获取
 # -----------------------------
-async def fetch_all_up_video_dynamic(uid: int, cookie: str) -> list[dict]:
+async def fetch_all_up_video_dynamic(
+    uid: int, cookie: str, max_count: int = 0
+) -> list[dict]:
     """自动翻页 + WBI 签名，获取指定 UP 主的全部视频动态（DYNAMIC_TYPE_AV）。
 
     Args:
         uid: UP 主的 B 站 UID。
         cookie: 登录后的 Cookie 字符串。
+        max_count: 最多获取的视频动态数量，0 表示不限制。
 
     Returns:
-        视频动态列表，每个元素包含 type、dynamic_id、title、bv、cover、desc、pubtime。
+        视频动态列表，每个元素包含 type、dynamic_id、title、bv、cover、desc、pubtime、duration。
     """
     headers = {
         "Cookie": cookie,
@@ -560,8 +558,20 @@ async def fetch_all_up_video_dynamic(uid: int, cookie: str) -> list[dict]:
                         "cover": archive["cover"],
                         "desc": archive.get("desc", ""),
                         "pubtime": item["modules"]["module_author"]["pub_ts"],
+                        "duration": parse_duration_text(
+                            archive.get("duration_text", "")
+                        ),
                     }
                 )
+
+                # 达到数量上限时停止收集
+                if max_count > 0 and len(results) >= max_count:
+                    break
+
+            # 达到数量上限或没有更多页时退出
+            if max_count > 0 and len(results) >= max_count:
+                break
+
             offset = data["data"]["offset"]
             if not offset:
                 break

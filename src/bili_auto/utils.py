@@ -30,6 +30,31 @@ def get_stream_url(stream: dict) -> str | None:
     return stream.get("baseUrl") or stream.get("base_url")
 
 
+def parse_duration_text(duration_text: str) -> int:
+    """将 B 站动态接口的 duration_text 字符串解析为整秒数。
+
+    支持两种格式：
+      - "mm:ss"     → 分钟:秒
+      - "hh:mm:ss"  → 小时:分钟:秒
+    无法解析时返回 0。
+
+    Args:
+        duration_text: B 站返回的时长字符串，例如 "12:34" 或 "1:23:45"。
+
+    Returns:
+        整秒数，例如 "12:34" → 754。
+    """
+    try:
+        parts = duration_text.strip().split(":")
+        if len(parts) == 2:
+            return int(parts[0]) * 60 + int(parts[1])
+        elif len(parts) == 3:
+            return int(parts[0]) * 3600 + int(parts[1]) * 60 + int(parts[2])
+        return 0
+    except (ValueError, AttributeError):
+        return 0
+
+
 def sanitize_title(text: str) -> str:
     """标题/作者名转安全文件名：去除首尾符号，内部符号替换为下划线，合并连续下划线。
 

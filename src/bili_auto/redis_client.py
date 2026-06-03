@@ -16,6 +16,7 @@ from bili_auto.config import (
     DOWNLOAD_LOCK_TTL_SECONDS,
     LOGIN_KEY_TTL_SECONDS,
     LOGIN_REDIS_PREFIX,
+    MAX_DURATION_SECONDS_KEY,
     REDIS_DB,
     REDIS_HOST,
     REDIS_KEY,
@@ -179,3 +180,27 @@ async def get_video_download_status(bvid: str) -> str | None:
 async def get_video_folder_name(bvid: str) -> str | None:
     """获取视频关联的收藏夹名称。"""
     return await r.hget(video_state_key(bvid), "folder_name")
+
+
+# -----------------------------
+# 视频时长过滤阈值（仅对 up_video_dynamic_all 接口生效）
+# -----------------------------
+async def get_max_duration_seconds() -> int | None:
+    """从 Redis 读取视频最大时长阈值（秒）。
+
+    超过该时长的视频不会被入队。不存在则返回 None 表示不过滤。
+    """
+    raw = await r.get(MAX_DURATION_SECONDS_KEY)
+    return int(raw) if raw is not None else None
+
+
+async def set_max_duration_seconds(seconds: int | None) -> None:
+    """设置（或删除）视频最大时长阈值。
+
+    Args:
+        seconds: 最大时长（秒），传入 0 或 None 时删除该 key 以关闭过滤。
+    """
+    if seconds and seconds > 0:
+        await r.set(MAX_DURATION_SECONDS_KEY, str(seconds))
+    else:
+        await r.delete(MAX_DURATION_SECONDS_KEY)

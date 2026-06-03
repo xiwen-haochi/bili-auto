@@ -393,7 +393,7 @@ async def download_up_all_photos(
 async def main():
 
     # 搜索示例
-    print(await search_up("张靓颖", download_avatar=False))
+    print(await search_up("吱吱", download_avatar=False))
     #       348710707
 
     # 获取 UP 信息
