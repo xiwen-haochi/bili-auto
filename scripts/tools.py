@@ -122,9 +122,96 @@ async def download_image(url: str, save_path: Path):
 
 
 # ---------------------------------------------------------
+# 通用搜索（按类型搜索，搜索用户时返回精简结果）
+# ---------------------------------------------------------
+async def search_bili(
+    keyword: str,
+    search_type: str = "user",
+    limit: int = 20,
+) -> dict:
+    """按类型搜索 B 站内容，搜索用户时返回用户名、UID 和粉丝数。
+
+    复用 search/all/v2 综合搜索接口（该接口无需 WBI 签名，更稳定），
+    按 result_type 筛选对应类型的结果。
+
+    search_type 可选值（与 B 站 result_type 对应）:
+        - "bili_user" / "user": 用户（返回 mid, uname, fans）
+        - "video": 视频
+        - "media_bangumi": 番剧
+        - "media_ft": 影视
+        - "live": 直播
+        - "article": 专栏
+        - "topic": 话题
+
+    Args:
+        keyword: 搜索关键词。
+        search_type: 搜索类型，默认 "user"。
+        limit: 返回条数上限，默认 20。
+
+    Returns:
+        dict: 搜索结果，包含 keyword, search_type, count, items 字段。
+              搜索用户时 items 每项包含 mid, uname, fans。
+    """
+    # 兼容简写类型名
+    type_map = {"user": "bili_user"}
+    api_type = type_map.get(search_type, search_type)
+
+    url = "https://api.bilibili.com/x/web-interface/search/all/v2"
+
+    async with httpx.AsyncClient(headers=HEADERS, timeout=10) as client:
+        resp = await client.get(url, params={"keyword": keyword})
+        data = await safe_json(resp)
+
+    if data.get("code") != 0:
+        return {"error": "search failed", "raw": data}
+
+    # search/all/v2 返回混合结果，按 result_type 筛选对应类型
+    result_blocks = data["data"].get("result") or []
+    raw_items = []
+    for block in result_blocks:
+        if block.get("result_type") == api_type:
+            raw_items = block.get("data", [])
+            break
+
+    items = []
+    for item in raw_items[:limit]:
+        if api_type == "bili_user":
+            items.append(
+                {
+                    "mid": item["mid"],
+                    "uname": item["uname"],
+                    "fans": item.get("fans", 0),
+                }
+            )
+        elif api_type == "video":
+            items.append(
+                {
+                    "bvid": item["bvid"],
+                    "mid": item.get("mid", 0),
+                    "title": item["title"]
+                    .replace('<em class="keyword">', "")
+                    .replace("</em>", ""),
+                    "author": item["author"],
+                    "play": item.get("play", 0),
+                    "duration": item.get("duration", ""),
+                }
+            )
+        else:
+            items.append(item)
+
+    # 移除不再需要的 wbi 导入（由 get_wbi_key 引入）
+    return {
+        "keyword": keyword,
+        "search_type": search_type,
+        "count": len(items),
+        "items": items,
+    }
+
+
+# ---------------------------------------------------------
 # 获取 UP 主信息（新增 download_photos 参数）
 # ---------------------------------------------------------
-async def up_info(mid: int, download_photos: bool = False):
+async def up_info(mid: int, download_avatar: bool = False):
     url = "https://api.bilibili.com/x/web-interface/card"
 
     async with httpx.AsyncClient(headers=HEADERS, timeout=10) as client:
@@ -147,8 +234,8 @@ async def up_info(mid: int, download_photos: bool = False):
         "level": card["level_info"]["current_level"],
     }
 
-    if download_photos:
-        pass
+    if download_avatar:
+        result["face_local"] = await download_face(card["face"], card["name"])
 
     return result
 
@@ -391,19 +478,24 @@ async def download_up_all_photos(
 # 测试入口
 # ---------------------------------------------------------
 async def main():
+    pass
+
+    # 搜索关键字
+    # res = await search_bili("一拳超人", search_type="video", limit=10)
+    # print(res)
 
     # 搜索示例
-    print(await search_up("吱吱", download_avatar=False))
-    #       348710707
+    # print(await search_up("一拳超人", download_avatar=True))
+    #
 
     # 获取 UP 信息
-    # info = await up_info(1889545341)
+    # info = await up_info(1889545341, download_avatar=True)
     # print(info)
 
     # 20260522 使用过
     # 下载 UP 主所有图片动态（基本用法）
-    # result = await download_up_all_photos(mid=1889545341)
-    # print(result)
+    result = await download_up_all_photos(mid=1889545341)
+    print(result)
 
     # 仅阅读最近 50 条动态中的图片动态
     # result = await download_up_all_photos(mid=1889545341, max_dynamics=50)
