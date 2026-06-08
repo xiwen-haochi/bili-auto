@@ -60,6 +60,10 @@ MAX_DOWNLOADS_PER_RUN = int(os.getenv("MAX_DOWNLOADS_PER_RUN", "10"))
 DOWNLOAD_INTERVAL_SECONDS = int(os.getenv("DOWNLOAD_INTERVAL_SECONDS", "3"))
 MAX_DOWNLOAD_RETRIES = int(os.getenv("MAX_DOWNLOAD_RETRIES", "5"))
 
+# 单视频级别重试次数：download_file 内部重试耗尽后，重新请求 playurl API
+# 获取新的 CDN 地址再尝试下载
+MAX_PLAY_URL_RETRIES = int(os.getenv("MAX_PLAY_URL_RETRIES", "3"))
+
 # DOWNLOAD_MODE：控制 async_main() 的执行方式。
 #   bg   （默认）：启动后台 asyncio task 后立即返回，适合从 API 服务触发。
 #   sync          ：原地等待全部下载完成再返回，适合 CLI 直接运行。

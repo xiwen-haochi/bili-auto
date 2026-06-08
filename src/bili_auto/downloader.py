@@ -28,6 +28,7 @@ from bili_auto.config import (
     MAX_DOWNLOAD_RETRIES,
     MAX_DOWNLOADS_PER_RUN,
     MAX_MP4_SIZE,
+    MAX_PLAY_URL_RETRIES,
     VIDEO_DONE_TTL_SECONDS,
     VIDEO_REDIS_PREFIX,
 )
@@ -358,21 +359,65 @@ async def download_bv(bvid: str, cookie: str) -> None:
 
         if videos and audios:
             # DASH 模式：分别下载视频流和音频流，之后用 ffmpeg 合并
+            # 外层重试：download_file 内层重试耗尽后，重新请求 playurl API
+            # 获取新的 CDN 地址再尝试，避免始终撞同一个不稳定的 CDN 节点
             is_dash = True
 
-            best_video = select_best_video_stream(videos)
-            best_audio = select_best_audio_stream(audios)
-            video_url = get_stream_url(best_video)
-            audio_url = get_stream_url(best_audio)
+            for play_attempt in range(1, MAX_PLAY_URL_RETRIES + 1):
+                best_video = select_best_video_stream(videos)
+                best_audio = select_best_audio_stream(audios)
+                video_url = get_stream_url(best_video)
+                audio_url = get_stream_url(best_audio)
 
-            if not video_url or not audio_url:
-                raise RuntimeError(f"无法解析 DASH 音视频下载地址：{play_resp}")
+                if not video_url or not audio_url:
+                    raise RuntimeError(f"无法解析 DASH 音视频下载地址：{play_resp}")
 
-            video_file = video_dir / f"{bvid}_video.m4s"
-            audio_file = video_dir / f"{bvid}_audio.m4s"
+                video_file = video_dir / f"{bvid}_video.m4s"
+                audio_file = video_dir / f"{bvid}_audio.m4s"
 
-            await download_file(client, video_url, video_file)
-            await download_file(client, audio_url, audio_file)
+                try:
+                    await download_file(client, video_url, video_file)
+                    await download_file(client, audio_url, audio_file)
+                    break  # 下载成功，退出外层重试循环
+                except httpx.TransportError:
+                    if play_attempt == MAX_PLAY_URL_RETRIES:
+                        raise
+
+                    logger.warning(
+                        "BV %s DASH 下载失败（第 %d/%d 次），" "将重新获取播放地址",
+                        bvid,
+                        play_attempt,
+                        MAX_PLAY_URL_RETRIES,
+                    )
+
+                    # 删除部分下载的文件
+                    video_file.unlink(missing_ok=True)
+                    audio_file.unlink(missing_ok=True)
+
+                    # 重新请求 playurl API，获取新的 CDN 地址
+                    play_resp = await fetch_json(
+                        client,
+                        "https://api.bilibili.com/x/player/playurl",
+                        params={
+                            "bvid": bvid,
+                            "cid": cid,
+                            "qn": 127,
+                            "fnval": 16,
+                            "fourk": 1,
+                        },
+                    )
+                    if play_resp.get("code") != 0:
+                        raise RuntimeError(f"重新获取播放地址失败：{play_resp}")
+
+                    dash = play_resp.get("data", {}).get("dash", {})
+                    videos = dash.get("video") or []
+                    audios = dash.get("audio") or []
+
+                    if not videos or not audios:
+                        raise RuntimeError(
+                            "重新获取播放地址后仍无 DASH 流，"
+                            "建议降级为 durl 模式手动处理"
+                        )
         else:
             # durl 回退模式：部分视频无 DASH 流，使用传统直链 mp4
             # 注意：fnval=16 请求下非DASH视频的 durl 可能不完整（仅预览片段），
@@ -400,10 +445,42 @@ async def download_bv(bvid: str, cookie: str) -> None:
 
             if len(durl_list) == 1:
                 # 单段 durl：直接下载即为完整 mp4
-                video_url = durl_list[0].get("url")
-                if not video_url:
-                    raise RuntimeError("无法解析 durl 下载地址")
-                await download_file(client, video_url, output_file)
+                # 同样增加外层重试，避免单个 CDN 节点不稳定
+                for play_attempt in range(1, MAX_PLAY_URL_RETRIES + 1):
+                    video_url = durl_list[0].get("url")
+                    if not video_url:
+                        raise RuntimeError("无法解析 durl 下载地址")
+                    try:
+                        await download_file(client, video_url, output_file)
+                        break
+                    except httpx.TransportError:
+                        if play_attempt == MAX_PLAY_URL_RETRIES:
+                            raise
+                        logger.warning(
+                            "BV %s durl 下载失败（第 %d/%d 次），" "将重新获取播放地址",
+                            bvid,
+                            play_attempt,
+                            MAX_PLAY_URL_RETRIES,
+                        )
+                        output_file.unlink(missing_ok=True)
+                        durl_play_resp = await fetch_json(
+                            client,
+                            "https://api.bilibili.com/x/player/playurl",
+                            params={
+                                "bvid": bvid,
+                                "cid": cid,
+                                "qn": 127,
+                                "fnval": 1,
+                                "fourk": 1,
+                            },
+                        )
+                        if durl_play_resp.get("code") != 0:
+                            raise RuntimeError(
+                                f"重新获取 durl 播放地址失败：{durl_play_resp}"
+                            )
+                        durl_list = durl_play_resp.get("data", {}).get("durl") or []
+                        if not durl_list:
+                            raise RuntimeError("重新获取后无 durl 直链")
             else:
                 # 多段 durl：逐段下载，然后用 ffmpeg concat 合并
                 segment_files: list[Path] = []
