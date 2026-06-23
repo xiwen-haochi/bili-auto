@@ -38,6 +38,11 @@ MAX_DURATION_SECONDS_KEY = os.getenv(
     "MAX_DURATION_SECONDS_KEY", "bili:config:max_duration_seconds"
 )
 
+# 单轮最大下载数，可通过 Redis 动态覆盖 .env 中的默认值
+MAX_DOWNLOADS_PER_RUN_KEY = os.getenv(
+    "MAX_DOWNLOADS_PER_RUN_KEY", "bili:config:max_downloads_per_run"
+)
+
 # -----------------------------
 # 扫描收藏夹参数
 # -----------------------------
@@ -63,6 +68,17 @@ MAX_DOWNLOAD_RETRIES = int(os.getenv("MAX_DOWNLOAD_RETRIES", "5"))
 # 单视频级别重试次数：download_file 内部重试耗尽后，重新请求 playurl API
 # 获取新的 CDN 地址再尝试下载
 MAX_PLAY_URL_RETRIES = int(os.getenv("MAX_PLAY_URL_RETRIES", "3"))
+
+# playurl API 触发风控（错误码 87008）时的指数退避基础等待秒数。
+# 第 N 次重试等待 = base * (2^(N-1))，例如 base=8 时等待 8/16/32 秒。
+PLAYURL_RATE_LIMIT_BACKOFF_BASE = int(os.getenv("PLAYURL_RATE_LIMIT_BACKOFF_BASE", "8"))
+
+# playurl API 最大退避等待秒数，防止无限制增长
+PLAYURL_RATE_LIMIT_MAX_DELAY = int(os.getenv("PLAYURL_RATE_LIMIT_MAX_DELAY", "120"))
+
+# 视频间间隔的随机抖动范围（秒），在 DOWNLOAD_INTERVAL_SECONDS 基础上
+# 额外增加 random(0, JITTER) 的延迟，避免请求模式过于规律被风控识别
+DOWNLOAD_INTERVAL_JITTER = int(os.getenv("DOWNLOAD_INTERVAL_JITTER", "5"))
 
 # DOWNLOAD_MODE：控制 async_main() 的执行方式。
 #   bg   （默认）：启动后台 asyncio task 后立即返回，适合从 API 服务触发。

@@ -12,7 +12,8 @@ if str(_src_dir) not in sys.path:
     sys.path.insert(0, str(_src_dir))
 
 from bili_auto.utils import get_wbi_key, wbi_sign
-from bili_auto.redis_client import load_cookie
+from bili_auto.redis_client import load_cookie, enqueue_ready_video
+from bili_auto.bilibili_api import fetch_user_fav_folders
 
 
 HEADERS = {
@@ -474,15 +475,41 @@ async def download_up_all_photos(
     return result
 
 
+async def get_user_fav_folders(uid: int) -> list[dict]:
+    """获取指定用户的所有公开收藏夹列表。
+
+    Args:
+        uid: 目标用户的 B 站 UID。
+        cookie: 登录后的 Cookie 字符串。
+
+    Returns:
+        收藏夹列表，每个元素包含 id、title、media_count。
+    """
+    cookie = await load_cookie()
+    if not cookie:
+        return []
+    folders = await fetch_user_fav_folders(uid, cookie)
+    return folders
+
+
 # ---------------------------------------------------------
 # 测试入口
 # ---------------------------------------------------------
 async def main():
+    from pprint import pprint as print
+
     pass
 
+    # 获取收藏夹列表
+    # folders = await get_user_fav_folders(7792521)
+    # print(folders)
+
+    # 入队列
+    # await enqueue_ready_video("123", folder_name="123")
+
     # 搜索关键字
-    # res = await search_bili("一拳超人", search_type="video", limit=10)
-    # print(res)
+    res = await search_bili("123", search_type="video", limit=10)
+    print(res)
 
     # 搜索示例
     # print(await search_up("一拳超人", download_avatar=True))
@@ -494,8 +521,8 @@ async def main():
 
     # 20260522 使用过
     # 下载 UP 主所有图片动态（基本用法）
-    result = await download_up_all_photos(mid=1889545341)
-    print(result)
+    # result = await download_up_all_photos(mid=1889545341)
+    # print(result)
 
     # 仅阅读最近 50 条动态中的图片动态
     # result = await download_up_all_photos(mid=1889545341, max_dynamics=50)

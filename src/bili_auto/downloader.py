@@ -10,6 +10,7 @@
 
 import asyncio
 import logging
+import random
 import sys
 from logging.handlers import TimedRotatingFileHandler
 from pathlib import Path
@@ -21,6 +22,7 @@ from bili_auto.config import (
     BASE_HEADERS,
     DOWNLOAD_CLIENT_TIMEOUT,
     DOWNLOAD_DIR,
+    DOWNLOAD_INTERVAL_JITTER,
     DOWNLOAD_INTERVAL_SECONDS,
     DOWNLOAD_LOCK_KEY,
     DOWNLOAD_MODE,
@@ -29,12 +31,15 @@ from bili_auto.config import (
     MAX_DOWNLOADS_PER_RUN,
     MAX_MP4_SIZE,
     MAX_PLAY_URL_RETRIES,
+    PLAYURL_RATE_LIMIT_BACKOFF_BASE,
+    PLAYURL_RATE_LIMIT_MAX_DELAY,
     VIDEO_DONE_TTL_SECONDS,
     VIDEO_REDIS_PREFIX,
 )
 from bili_auto.redis_client import (
     acquire_download_lock,
     add_video_downloaded,
+    get_max_downloads_per_run,
     get_video_folder_name,
     load_cookie,
     mark_video_status,
@@ -290,6 +295,79 @@ async def split_mp4(source: Path, max_bytes: int) -> list[Path]:
 
 
 # -----------------------------
+# playurl API 辅助函数：带风控退避重试
+# -----------------------------
+# B 站 playurl API 错误码 87008 表示当前请求触发频率风控，
+# 需要等待一段时间后重试（指数退避）。
+_PLAYURL_87008_RETRIES = 5  # 87008 风控专用重试次数
+
+
+async def _fetch_playurl(
+    client: httpx.AsyncClient,
+    bvid: str,
+    cid: int,
+    params: dict | None = None,
+) -> dict:
+    """调用 B 站 playurl API，针对 87008 风控错误做指数退避重试。
+
+    当返回 code=87008 时，自动等待递增时长后重试；
+    其他非 0 错误码直接抛出 RuntimeError。
+
+    Args:
+        client: 共享的 httpx AsyncClient 实例。
+        bvid: 视频 BV 号（仅用于日志）。
+        cid: 视频分 P 的 cid。
+        params: 额外的查询参数（如 fnval 等）。
+
+    Returns:
+        playurl API 的完整 JSON 响应。
+
+    Raises:
+        RuntimeError: 非 87008 错误或 87008 重试耗尽后抛出。
+    """
+    base_params = {"bvid": bvid, "cid": cid, "qn": 127, "fourk": 1}
+    if params:
+        base_params.update(params)
+
+    for attempt in range(1, _PLAYURL_87008_RETRIES + 1):
+        resp = await fetch_json(
+            client,
+            "https://api.bilibili.com/x/player/playurl",
+            params=base_params,
+        )
+
+        code = resp.get("code", 0)
+        if code == 0:
+            return resp
+
+        # 87008 风控限流：指数退避后重试
+        if code == 87008:
+            if attempt == _PLAYURL_87008_RETRIES:
+                raise RuntimeError(
+                    f"获取播放地址失败（87008 风控，已重试 {_PLAYURL_87008_RETRIES} 次）：{resp}"
+                )
+            delay = min(
+                PLAYURL_RATE_LIMIT_BACKOFF_BASE * (2 ** (attempt - 1)),
+                PLAYURL_RATE_LIMIT_MAX_DELAY,
+            )
+            # 加随机抖动，避免多线程/多进程同时重试的惊群效应
+            jitter = random.uniform(0, delay * 0.3)
+            total_delay = delay + jitter
+            logger.warning(
+                "BV %s playurl 触发风控 87008，第 %d/%d 次重试，等待 %.1f 秒",
+                bvid,
+                attempt,
+                _PLAYURL_87008_RETRIES,
+                total_delay,
+            )
+            await asyncio.sleep(total_delay)
+            continue
+
+        # 其他非 0 错误：不重试，直接抛
+        raise RuntimeError(f"获取播放地址失败：{resp}")
+
+
+# -----------------------------
 # 单视频下载流程
 # -----------------------------
 async def download_bv(bvid: str, cookie: str) -> None:
@@ -329,14 +407,7 @@ async def download_bv(bvid: str, cookie: str) -> None:
         if folder_name:
             folder_name = f"fav-{sanitize_title(folder_name)}"
 
-        play_resp = await fetch_json(
-            client,
-            "https://api.bilibili.com/x/player/playurl",
-            params={"bvid": bvid, "cid": cid, "qn": 127, "fnval": 16, "fourk": 1},
-        )
-
-        if play_resp.get("code") != 0:
-            raise RuntimeError(f"获取播放地址失败：{play_resp}")
+        play_resp = await _fetch_playurl(client, bvid, cid, params={"fnval": 16})
 
         safe_author = sanitize_title(author)
         clean_title = sanitize_title(title)
@@ -395,19 +466,9 @@ async def download_bv(bvid: str, cookie: str) -> None:
                     audio_file.unlink(missing_ok=True)
 
                     # 重新请求 playurl API，获取新的 CDN 地址
-                    play_resp = await fetch_json(
-                        client,
-                        "https://api.bilibili.com/x/player/playurl",
-                        params={
-                            "bvid": bvid,
-                            "cid": cid,
-                            "qn": 127,
-                            "fnval": 16,
-                            "fourk": 1,
-                        },
+                    play_resp = await _fetch_playurl(
+                        client, bvid, cid, params={"fnval": 16}
                     )
-                    if play_resp.get("code") != 0:
-                        raise RuntimeError(f"重新获取播放地址失败：{play_resp}")
 
                     dash = play_resp.get("data", {}).get("dash", {})
                     videos = dash.get("video") or []
@@ -424,20 +485,9 @@ async def download_bv(bvid: str, cookie: str) -> None:
             # 需用 fnval=1 重新请求以获取完整分段
             logger.info("BV %s 无 DASH 流，切换到 durl（非DASH）格式下载", bvid)
 
-            durl_play_resp = await fetch_json(
-                client,
-                "https://api.bilibili.com/x/player/playurl",
-                params={
-                    "bvid": bvid,
-                    "cid": cid,
-                    "qn": 127,
-                    "fnval": 1,
-                    "fourk": 1,
-                },
+            durl_play_resp = await _fetch_playurl(
+                client, bvid, cid, params={"fnval": 1}
             )
-
-            if durl_play_resp.get("code") != 0:
-                raise RuntimeError(f"获取 durl 播放地址失败：{durl_play_resp}")
 
             durl_list = durl_play_resp.get("data", {}).get("durl") or []
             if not durl_list:
@@ -463,21 +513,9 @@ async def download_bv(bvid: str, cookie: str) -> None:
                             MAX_PLAY_URL_RETRIES,
                         )
                         output_file.unlink(missing_ok=True)
-                        durl_play_resp = await fetch_json(
-                            client,
-                            "https://api.bilibili.com/x/player/playurl",
-                            params={
-                                "bvid": bvid,
-                                "cid": cid,
-                                "qn": 127,
-                                "fnval": 1,
-                                "fourk": 1,
-                            },
+                        durl_play_resp = await _fetch_playurl(
+                            client, bvid, cid, params={"fnval": 1}
                         )
-                        if durl_play_resp.get("code") != 0:
-                            raise RuntimeError(
-                                f"重新获取 durl 播放地址失败：{durl_play_resp}"
-                            )
                         durl_list = durl_play_resp.get("data", {}).get("durl") or []
                         if not durl_list:
                             raise RuntimeError("重新获取后无 durl 直链")
@@ -549,7 +587,12 @@ async def process_ready_queue() -> None:
         logger.info("ready 队列为空，无需下载")
         return
 
-    batch = ready_bvs[:MAX_DOWNLOADS_PER_RUN]
+    # 动态读取单轮最大下载数：优先 Redis，Redis 无值时回退到 .env / 默认值
+    max_per_run = await get_max_downloads_per_run()
+    if max_per_run is None:
+        max_per_run = MAX_DOWNLOADS_PER_RUN
+
+    batch = ready_bvs[:max_per_run]
     logger.info("本次共 %d 个待下载视频，最多处理 %d 个", len(ready_bvs), len(batch))
 
     await update_lock_progress(0, len(batch))
@@ -593,7 +636,11 @@ async def process_ready_queue() -> None:
         await update_lock_progress(idx + 1, len(batch))
 
         if idx < len(batch) - 1:
-            await asyncio.sleep(DOWNLOAD_INTERVAL_SECONDS)
+            # 在基础间隔上增加随机抖动，避免请求模式过于规律被 B 站风控识别
+            jitter = random.uniform(0, DOWNLOAD_INTERVAL_JITTER)
+            total_delay = DOWNLOAD_INTERVAL_SECONDS + jitter
+            logger.debug("等待 %.1f 秒后处理下一个视频", total_delay)
+            await asyncio.sleep(total_delay)
 
 
 async def async_main() -> None:

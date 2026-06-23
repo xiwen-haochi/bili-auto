@@ -24,6 +24,7 @@ from bili_auto.bilibili_api import (
     fetch_fav_all_items,
     fetch_followings,
     fetch_latest_up_video_dynamic,
+    fetch_user_fav_folders,
     get_media_id_by_name,
     poll_login_status_task,
     scan_fav,
@@ -222,16 +223,36 @@ async def scan_fav_api(folder_name: str | None = None):
 
 
 # -----------------------------
+# 路由：查看指定用户的收藏夹列表
+# -----------------------------
+@app.get("/user_fav_folders")
+async def user_fav_folders(uid: int):
+    """获取指定 UID 用户的所有公开收藏夹，返回 [{id, title, media_count}]。
+
+    不需登录也可访问（通过 B 站公开接口），但建议登录以获取更准数据。
+    """
+    cookie = await load_cookie() or ""
+
+    folders = await fetch_user_fav_folders(uid, cookie)
+    return {
+        "status": "ok",
+        "uid": uid,
+        "count": len(folders),
+        "folders": folders,
+    }
+
+
+# -----------------------------
 # 路由：查看收藏夹内容
 # -----------------------------
 @app.get("/fav_items")
-async def fav_items(folder_name: str):
+async def fav_items(folder_name: str, uid: str | None = None):
     """获取指定收藏夹的全部内容，返回 [{bv, rid, title}]。"""
     cookie = await load_cookie()
     if not cookie:
         return {"error": "not logged in"}
 
-    data = await fetch_fav_all_items(cookie, folder_name)
+    data = await fetch_fav_all_items(cookie, folder_name, uid)
     return data
 
 

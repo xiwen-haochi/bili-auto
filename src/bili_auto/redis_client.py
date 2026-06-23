@@ -16,6 +16,7 @@ from bili_auto.config import (
     DOWNLOAD_LOCK_TTL_SECONDS,
     LOGIN_KEY_TTL_SECONDS,
     LOGIN_REDIS_PREFIX,
+    MAX_DOWNLOADS_PER_RUN_KEY,
     MAX_DURATION_SECONDS_KEY,
     REDIS_DB,
     REDIS_HOST,
@@ -180,6 +181,31 @@ async def get_video_download_status(bvid: str) -> str | None:
 async def get_video_folder_name(bvid: str) -> str | None:
     """获取视频关联的收藏夹名称。"""
     return await r.hget(video_state_key(bvid), "folder_name")
+
+
+# -----------------------------
+# 单轮最大下载数（Redis 值覆盖 .env 默认值）
+# -----------------------------
+async def get_max_downloads_per_run() -> int | None:
+    """从 Redis 读取单轮最大下载数。
+
+    存在则返回该值（覆盖 .env 中的 MAX_DOWNLOADS_PER_RUN），
+    不存在则返回 None 表示使用 .env 默认值。
+    """
+    raw = await r.get(MAX_DOWNLOADS_PER_RUN_KEY)
+    return int(raw) if raw is not None else None
+
+
+async def set_max_downloads_per_run(count: int | None) -> None:
+    """设置（或删除）单轮最大下载数。
+
+    Args:
+        count: 最大下载数，传入 0 或 None 时删除该 key 以回退到 .env 默认值。
+    """
+    if count and count > 0:
+        await r.set(MAX_DOWNLOADS_PER_RUN_KEY, str(count))
+    else:
+        await r.delete(MAX_DOWNLOADS_PER_RUN_KEY)
 
 
 # -----------------------------

@@ -167,12 +167,15 @@ async def poll_login_status_task(qrcode_key: str) -> None:
 # -----------------------------
 # 收藏夹扫描
 # -----------------------------
-async def scan_fav(cookie: str, folder_name: str | None = None) -> list[dict]:
+async def scan_fav(
+    cookie: str, folder_name: str | None = None, uid: str | None = None
+) -> list[dict]:
     """扫描指定收藏夹中未下载的视频，返回新增的 BV 列表。
 
     Args:
         cookie: 登录后的 Cookie 字符串。
         folder_name: 要扫描的收藏夹名称，None 表示扫描所有收藏夹。
+        uid: UP 主 ID，None 表示从 cookie 中提取。
 
     Returns:
         新增视频列表，每个元素为 {"bv", "rid", "media_id"}。
@@ -182,10 +185,11 @@ async def scan_fav(cookie: str, folder_name: str | None = None) -> list[dict]:
     async with httpx.AsyncClient(headers=headers, timeout=API_CLIENT_TIMEOUT) as client:
         wbi_key = await get_wbi_key(client)
 
-        nav_resp = await fetch_json(
-            client, "https://api.bilibili.com/x/web-interface/nav"
-        )
-        uid = nav_resp["data"]["mid"]
+        if uid is None:
+            nav_resp = await fetch_json(
+                client, "https://api.bilibili.com/x/web-interface/nav"
+            )
+            uid = nav_resp["data"]["mid"]
 
         fav_resp = await fetch_json(
             client,
@@ -277,12 +281,15 @@ async def delete_fav_item(
 # -----------------------------
 # 获取指定收藏夹全部内容
 # -----------------------------
-async def fetch_fav_all_items(cookie: str, folder_name: str) -> list[dict]:
+async def fetch_fav_all_items(
+    cookie: str, folder_name: str, uid: str | None = None
+) -> list[dict]:
     """获取指定收藏夹的全部内容，返回 [{bv, rid, title}]。
 
     Args:
         cookie: 登录后的 Cookie 字符串。
         folder_name: 收藏夹名称。
+        uid: UP 主 ID，None 表示从 cookie 中提取。
 
     Returns:
         视频列表，每个元素包含 bv、rid、title。
@@ -291,11 +298,11 @@ async def fetch_fav_all_items(cookie: str, folder_name: str) -> list[dict]:
 
     async with httpx.AsyncClient(headers=headers, timeout=API_CLIENT_TIMEOUT) as client:
         wbi_key = await get_wbi_key(client)
-
-        nav_resp = await fetch_json(
-            client, "https://api.bilibili.com/x/web-interface/nav"
-        )
-        uid = nav_resp["data"]["mid"]
+        if uid is None:
+            nav_resp = await fetch_json(
+                client, "https://api.bilibili.com/x/web-interface/nav"
+            )
+            uid = nav_resp["data"]["mid"]
 
         fav_resp = await fetch_json(
             client,
@@ -491,6 +498,56 @@ async def get_media_id_by_name(
             return f["id"]
 
     return None
+
+
+# -----------------------------
+# 获取指定 UID 用户的所有公开收藏夹
+# -----------------------------
+async def fetch_user_fav_folders(uid: int, cookie: str) -> list[dict]:
+    """获取指定用户的所有公开收藏夹列表。
+
+    Args:
+        uid: 目标用户的 B 站 UID。
+        cookie: 登录后的 Cookie 字符串。
+
+    Returns:
+        收藏夹列表，每个元素包含 id、title、media_count。
+    """
+    headers = {
+        "Cookie": cookie,
+        **BASE_HEADERS,
+        "Origin": "https://space.bilibili.com",
+        "Referer": f"https://space.bilibili.com/{uid}/favlist",
+    }
+
+    async with httpx.AsyncClient(headers=headers, timeout=API_CLIENT_TIMEOUT) as client:
+        wbi_key = await get_wbi_key(client)
+
+        params: dict = {"up_mid": uid, "web_location": "333.1387"}
+        params = wbi_sign(params, wbi_key)
+
+        resp = await fetch_json(
+            client,
+            "https://api.bilibili.com/x/v3/fav/folder/created/list-all",
+            params=params,
+        )
+
+        if resp.get("code") != 0:
+            logger.error("获取用户 %s 收藏夹列表失败: %s", uid, resp)
+            return []
+
+        data = resp.get("data")
+        if not data:
+            return []
+        folders = data.get("list") or []
+        return [
+            {
+                "id": f["id"],
+                "title": f["title"],
+                "media_count": f.get("media_count", 0),
+            }
+            for f in folders
+        ]
 
 
 # -----------------------------
