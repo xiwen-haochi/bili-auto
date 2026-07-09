@@ -21,10 +21,12 @@ from fastapi.security.api_key import APIKeyHeader
 from bili_auto.bilibili_api import (
     delete_fav_item,
     fetch_all_up_video_dynamic,
+    fetch_collected_fav_folders,
     fetch_fav_all_items,
     fetch_followings,
     fetch_latest_up_video_dynamic,
     fetch_user_fav_folders,
+    fetch_video_seasons_series,
     get_media_id_by_name,
     poll_login_status_task,
     scan_fav,
@@ -243,16 +245,92 @@ async def user_fav_folders(uid: int):
 
 
 # -----------------------------
+# 路由：获取用户全部收藏夹（自建 + 收藏别人的 + 视频合集）
+# -----------------------------
+@app.get("/all_fav_folders")
+async def all_fav_folders(uid: int | None = None):
+    """获取用户的全部收藏类资源，包括三类：
+
+    1. created: 自己新建的收藏夹（通过 created/list-all 接口）
+    2. collected: 收藏/追更的别人的收藏夹（通过 collected/list 接口）
+    3. series: 用户空间的视频合集（通过 seasons_series_list 接口）
+
+    uid 不传时默认使用当前登录用户。
+
+    Returns:
+        {
+            "status": "ok",
+            "uid": 123,
+            "created": [...],    # 自建收藏夹
+            "collected": [...],  # 追更的收藏夹
+            "series": [...]      # 视频合集
+        }
+    """
+    cookie = await load_cookie() or ""
+
+    # uid 不传时从 cookie 中获取当前用户 mid
+    if uid is None:
+        async with httpx.AsyncClient(
+            headers={"Cookie": cookie, **BASE_HEADERS}, timeout=30
+        ) as client:
+            nav = await fetch_json(
+                client, "https://api.bilibili.com/x/web-interface/nav"
+            )
+            if nav.get("code") != 0 and cookie:
+                return {"error": "获取当前用户信息失败", "raw": nav}
+            uid = nav["data"]["mid"]
+
+    # 并行获取三类数据（收藏别人的和视频合集需要登录）
+    if cookie:
+        created_folders, collected_folders, series_list = await asyncio.gather(
+            fetch_user_fav_folders(uid, cookie),
+            fetch_collected_fav_folders(uid, cookie),
+            fetch_video_seasons_series(uid, cookie),
+        )
+    else:
+        created_folders = await fetch_user_fav_folders(uid, cookie)
+        collected_folders = []
+        series_list = []
+
+    return {
+        "status": "ok",
+        "uid": uid,
+        "created": created_folders,
+        "created_count": len(created_folders),
+        "collected": collected_folders or [],
+        "collected_count": len(collected_folders) if collected_folders else 0,
+        "series": series_list or [],
+        "series_count": len(series_list) if series_list else 0,
+    }
+
+
+# -----------------------------
 # 路由：查看收藏夹内容
 # -----------------------------
 @app.get("/fav_items")
-async def fav_items(folder_name: str, uid: str | None = None):
-    """获取指定收藏夹的全部内容，返回 [{bv, rid, title}]。"""
+async def fav_items(
+    folder_name: str | None = None,
+    uid: str | None = None,
+    media_id: int | None = None,
+):
+    """获取指定收藏夹的全部内容，返回 [{bv, rid, title}]。
+
+    支持两种查找方式：
+      - media_id: 直接传入收藏夹完整 ID（优先），跳过名称搜索
+      - folder_name: 按名称在自建 + 收藏的收藏夹中搜索
+
+    不传 media_id 也不传 folder_name 时返回错误。
+    """
     cookie = await load_cookie()
     if not cookie:
         return {"error": "not logged in"}
 
-    data = await fetch_fav_all_items(cookie, folder_name, uid)
+    if media_id is None and not folder_name:
+        return {"error": "folder_name 或 media_id 至少需要一个"}
+
+    data = await fetch_fav_all_items(
+        cookie, folder_name=folder_name, uid=uid, media_id=media_id
+    )
     return data
 
 
@@ -348,7 +426,9 @@ async def download_status():
 # 路由：获取指定 UP 主的视频动态
 # -----------------------------
 @app.get("/up_video_dynamic_all")
-async def up_video_dynamic_all(uid: int, run_try: bool = False, count: int = 0):
+async def up_video_dynamic_all(
+    uid: int, run_try: bool = False, count: int = 0, search_key: str | None = None
+):
     """获取指定 UP 主的全部视频动态，并将 BV 写入待下载队列。
 
     视频时长过滤阈值从 Redis 读取（key: bili:config:max_duration_seconds，
@@ -368,7 +448,16 @@ async def up_video_dynamic_all(uid: int, run_try: bool = False, count: int = 0):
     data = await fetch_all_up_video_dynamic(uid, cookie, max_count=count)
     if isinstance(data, dict) and "error" in data:
         return data
-
+    if search_key:
+        if "|" in search_key:
+            data = []
+            for item in data:
+                for keyword in search_key.split("|"):
+                    if keyword in item["title"]:
+                        data.append(item)
+                        break
+        else:
+            data = [item for item in data if search_key in item["title"]]
     # 试运行模式：不入队，仅返回所有视频的基本信息
     if run_try:
         if max_duration and max_duration > 0:
@@ -528,6 +617,96 @@ async def keep_alive():
         return {"status": "ok", "uname": data["data"]["uname"]}
     else:
         return {"status": "failed", "data": data}
+
+
+# -----------------------------
+# 路由：获取指定收藏夹所有内容
+# -----------------------------
+@app.get("/get_collection_videos")
+async def get_collection_videos(
+    mid: int = Query(..., description="用户 ID"),
+    season_id: int = Query(..., description="收藏夹 ID"),
+    run_try: bool = Query(True, description="是否加入队列"),
+    count: int = Query(0, description="返回视频数量，0 表示全部"),
+    folder_name: str = Query(..., description="收藏夹名称"),
+):
+    """获取指定收藏夹所有视频（自动翻页），并自动添加到下载队列。"""
+    base_url = "https://api.bilibili.com/x/polymer/web-space/seasons_archives_list"
+
+    headers = {
+        "Referer": "https://www.bilibili.com",
+        "User-Agent": "Mozilla/5.0",
+    }
+
+    all_videos = []
+    page_num = 1
+    page_size = 30
+
+    async with httpx.AsyncClient(
+        headers=headers,
+        follow_redirects=True,
+        timeout=API_CLIENT_TIMEOUT,
+    ) as client:
+        while True:
+            params = {
+                "mid": mid,
+                "season_id": season_id,
+                "page_num": page_num,
+                "page_size": page_size,
+                "sort_reverse": False,
+                "wts": int(asyncio.get_event_loop().time()),
+            }
+
+            resp = await client.get(base_url, params=params)
+            data = resp.json()
+
+            if data.get("code") != 0:
+                logger.error("接口返回错误：%s", data)
+                break
+
+            archives = data["data"]["archives"]
+            if not archives:
+                break
+
+            all_videos.extend(archives)
+            logger.info("已获取第 %d 页，共 %d 个视频", page_num, len(archives))
+
+            # 如果指定了 count 且已收集足够数据，提前终止翻页
+            if count > 0 and len(all_videos) >= count:
+                break
+
+            page_info = data["data"]["page"]
+            total = page_info["total"]
+            if page_num * page_size >= total:
+                break
+
+            page_num += 1
+
+    # 按 count 截取最终使用的视频列表，0 表示全部
+    videos_to_process = all_videos[:count] if count > 0 else all_videos
+
+    # 收集视频的 bv 和 title，并检查是否已下载，仅未下载的加入队列
+    data = []
+    queued_count = 0
+    for video in videos_to_process:
+        bvid = video.get("bvid")
+        title = video.get("title", "")
+        if not bvid:
+            continue
+        data.append({"bv": bvid, "title": title})
+
+        # 检查是否已经下载过，未下载的才加入队列
+        if run_try and not await is_video_downloaded(bvid):
+            await enqueue_ready_video(bvid, folder_name)
+            queued_count += 1
+
+    return {
+        "status": "ok",
+        "total_videos": len(all_videos),
+        "queued_count": queued_count,
+        "season_id": season_id,
+        "data": data,
+    }
 
 
 # -----------------------------

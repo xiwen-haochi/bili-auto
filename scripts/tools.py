@@ -501,15 +501,15 @@ async def main():
     pass
 
     # 获取收藏夹列表
-    # folders = await get_user_fav_folders(7792521)
+    # folders = await get_user_fav_folders(123)
     # print(folders)
 
     # 入队列
-    # await enqueue_ready_video("123", folder_name="123")
+    await enqueue_ready_video("123", folder_name="123")
 
     # 搜索关键字
-    res = await search_bili("123", search_type="video", limit=10)
-    print(res)
+    # res = await search_bili("123", search_type="video", limit=100)
+    # print(res)
 
     # 搜索示例
     # print(await search_up("一拳超人", download_avatar=True))
